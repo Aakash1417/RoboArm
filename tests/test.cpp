@@ -28,11 +28,11 @@ int openSerial(const char *portName, int baudrate = B1000000)
     tcgetattr(fd, &options);
     cfsetispeed(&options, baudrate);
     cfsetospeed(&options, baudrate);
-    options.c_cflag |= (CLOCAL | CREAD); // Enable receiver
-    options.c_cflag &= ~PARENB;          // No parity
-    options.c_cflag &= ~CSTOPB;          // 1 stop bit
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
     options.c_cflag &= ~CSIZE;
-    options.c_cflag |= CS8; // 8 data bits
+    options.c_cflag |= CS8;
     tcsetattr(fd, TCSANOW, &options);
 
     return fd;
@@ -86,10 +86,11 @@ int main(int argc, char *argv[])
     if (fd < 0)
         return -1;
 
-    // Example: move servos with ID 1, 2, 3 to different positions
-    moveServo(fd, 1, 2048); // mid position
-    moveServo(fd, 2, 1024); // left
-    moveServo(fd, 3, 3072); // right
+    std::cout << "port opened" << std::endl;
+
+    std::cout << "File descriptor: " << fd << std::endl;
+
+    moveServo(fd, servoId, 0);
 
     std::cout << "Commands sent!" << std::endl;
 
