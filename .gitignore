@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+selftest_output/
+_scratch/
+_so_arm100_src/

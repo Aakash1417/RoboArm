@@ -1,0 +1,7 @@
+# Tested on Windows 10, Python 3.11.9 (CPU only, no CUDA needed).
+mujoco==3.17.0
+mediapipe==1.2.2
+opencv-contrib-python==5.0.0.93  # installed by mediapipe anyway; do not also install opencv-python
+mink==1.4.0
+daqp==0.11.0                      # QP solver used by mink
+numpy==2.4.6
