@@ -1,0 +1,246 @@
+"""Headless checks of the whole pipeline without a webcam or windows.
+
+    python selftest.py            # simulation, IK, mapping, MediaPipe model
+    python selftest.py --camera   # also try to open webcam 0 and read a frame
+
+Writes snapshot images to selftest_output/.
+"""
+
+import os
+
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+
+import argparse  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import cv2  # noqa: E402
+import mujoco
+import numpy as np
+
+from so101_teleop.config import JOINT_NAMES, Config
+from so101_teleop.mapping import HandObservation, Teleop
+from so101_teleop.robot import CartesianIK, SO101Sim
+
+OUT = Path(__file__).resolve().parent / "selftest_output"
+failures = []
+
+
+def check(name, ok, detail=""):
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    if not ok:
+        failures.append(name)
+
+
+class Rig:
+    """Same control loop as main.py, but driven by scripted observations at 30 Hz."""
+
+    def __init__(self):
+        self.cfg = Config()
+        self.sim = SO101Sim(self.cfg.robot)
+        self.ik = CartesianIK(self.cfg.robot)
+        self.teleop = Teleop(self.cfg.mapping, self.cfg.robot, self.ik.home_target)
+        self.grip = self.cfg.robot.gripper_open
+        self.dt = 0.01
+        self.max_target_speed = 0.0
+        self.max_joint_speed = 0.0
+        self.limit_violation = 0.0
+
+    def run(self, seconds, obs_fn):
+        steps = int(seconds / self.dt)
+        lo, hi = self.sim.ctrl_lo, self.sim.ctrl_hi
+        for i in range(steps):
+            if i % 3 == 0:
+                self.teleop.observe(obs_fn(i * self.dt))
+            prev = self.teleop.target.copy()
+            target = self.teleop.step(self.dt)
+            self.max_target_speed = max(self.max_target_speed, np.linalg.norm(target - prev) / self.dt)
+            arm_q = self.ik.solve(target, self.dt)
+            want = self.cfg.robot.gripper_closed if self.teleop.gripper.closed else self.cfg.robot.gripper_open
+            s = self.cfg.robot.gripper_speed * self.dt
+            self.grip += np.clip(want - self.grip, -s, s)
+            self.sim.set_command(arm_q, self.grip)
+            self.sim.step(self.dt)
+            q = self.sim.joint_q
+            self.max_joint_speed = max(self.max_joint_speed, np.abs(self.sim.data.qvel[self.sim.qpos_adr[:5]]).max())
+            self.limit_violation = max(self.limit_violation, np.max(q - hi), np.max(lo - q))
+        return self.sim.ee_pos
+
+
+def hand(x=0.5, y=0.5, size=0.12, pinch=0.8):
+    return lambda t: HandObservation(x, y, size, pinch)
+
+
+def test_model():
+    sim = SO101Sim(Config().robot)
+    for i, n in enumerate(JOINT_NAMES):
+        jid = sim.model.joint(n).id
+        print(f"    {n:<13} joint range [{sim.model.jnt_range[jid, 0]:+.3f}, {sim.model.jnt_range[jid, 1]:+.3f}]"
+              f"  actuator ctrlrange [{sim.ctrl_lo[i]:+.3f}, {sim.ctrl_hi[i]:+.3f}]")
+    check("model loads with 6 actuators", sim.model.nu == 6)
+
+
+def test_ik_grid():
+    cfg = Config()
+    ik = CartesianIK(cfg.robot)
+    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target)
+    lo, hi = ik.joint_limits
+    errs = []
+    for x in np.linspace(0.14, 0.34, 5):
+        for y in np.linspace(-0.2, 0.2, 5):
+            for z in np.linspace(0.03, 0.25, 4):
+                tgt = teleop.clamp_workspace(np.array([x, y, z]))
+                ik.reset()
+                for _ in range(300):
+                    q = ik.solve(tgt, 0.01)
+                errs.append(np.linalg.norm(ik.ee_position() - tgt))
+                assert np.all(q >= lo - 1e-6) and np.all(q <= hi + 1e-6)
+    errs = np.array(errs)
+    check("IK reaches workspace targets", np.percentile(errs, 95) < 0.005,
+          f"(median {np.median(errs) * 1000:.1f} mm, 95th pct {np.percentile(errs, 95) * 1000:.1f} mm, "
+          f"max {errs.max() * 1000:.1f} mm over {len(errs)} targets)")
+
+
+def test_pipeline():
+    rig = Rig()
+    tp = rig.teleop
+    home = rig.run(1.5, hand())
+    check("calibration does not move the robot", np.linalg.norm(home - rig.ik.home_target) < 0.01,
+          f"(drift {np.linalg.norm(home - rig.ik.home_target) * 1000:.1f} mm)")
+
+    p = rig.run(2.0, hand(x=0.35))
+    check("hand left -> gripper moves left (+Y)", p[1] - home[1] > 0.05, f"(dy {p[1] - home[1]:+.3f} m)")
+    p = rig.run(3.0, hand(x=0.65))
+    check("hand right -> gripper moves right (-Y)", p[1] - home[1] < -0.05, f"(dy {p[1] - home[1]:+.3f} m)")
+    rig.run(2.0, hand())
+    p = rig.run(2.0, hand(y=0.35))
+    check("hand up -> gripper moves up (+Z)", p[2] - home[2] > 0.05, f"(dz {p[2] - home[2]:+.3f} m)")
+    p = rig.run(3.0, hand(y=0.62))
+    check("hand down -> gripper moves down (-Z)", p[2] - home[2] < -0.03, f"(dz {p[2] - home[2]:+.3f} m)")
+    rig.run(2.0, hand())
+
+    rig.run(1.0, hand(pinch=0.1))
+    g_closed = rig.sim.joint_q[5]
+    rig.run(1.0, hand(pinch=0.8))
+    g_open = rig.sim.joint_q[5]
+    check("pinch closes and opening releases gripper", tp.gripper.closed is False and g_closed < 0.1 < 1.0 < g_open,
+          f"(closed {g_closed:+.2f} rad, open {g_open:+.2f} rad)")
+
+    flicker = iter([0.1, 0.8, 0.1, 0.8, 0.37, 0.37, 0.37] * 50)
+    rig.run(1.0, lambda t: HandObservation(0.5, 0.5, 0.12, next(flicker)))
+    check("gripper ignores single-frame pinch flicker", tp.gripper.closed is False)
+
+    rig.run(0.5, hand(x=0.4, y=0.45))
+    before = rig.sim.ee_pos
+    rig.run(3.0, lambda t: None)
+    after = rig.sim.ee_pos
+    check("hand lost -> robot holds position", np.linalg.norm(after - before) < 0.01,
+          f"(moved {np.linalg.norm(after - before) * 1000:.1f} mm in 3 s)")
+
+    rig.max_target_speed = 0.0
+    rig.run(3.0, hand(x=0.95, y=0.1))
+    check("re-acquire far away -> bounded target speed",
+          rig.max_target_speed <= rig.cfg.robot.max_target_speed + 1e-6,
+          f"(max {rig.max_target_speed:.2f} m/s, limit {rig.cfg.robot.max_target_speed} m/s)")
+
+    rig.run(3.0, hand(x=-2.0, y=-2.0))
+    t = tp.target
+    inside = np.all(t >= rig.cfg.robot.workspace_min - 1e-9) and np.all(t <= rig.cfg.robot.workspace_max + 1e-9)
+    check("extreme hand position stays inside the workspace", inside, f"(target {np.round(t, 3)})")
+
+    tp.toggle_pause()
+    before = rig.sim.ee_pos
+    rig.run(1.5, hand(x=0.2, y=0.8, pinch=0.1))
+    check("pause holds arm and gripper", np.linalg.norm(rig.sim.ee_pos - before) < 0.01 and not tp.gripper.closed)
+    tp.toggle_pause()
+    p0 = rig.sim.ee_pos
+    rig.run(1.0, hand(x=0.2, y=0.8))
+    check("resume does not jump", np.linalg.norm(rig.sim.ee_pos - p0) < 0.01,
+          f"(moved {np.linalg.norm(rig.sim.ee_pos - p0) * 1000:.1f} mm)")
+
+    tp.reset_home()
+    p = rig.run(4.0, hand(x=0.2, y=0.8))
+    check("R returns to home", np.linalg.norm(p - rig.ik.home_target) < 0.01 and not tp.homing,
+          f"(error {np.linalg.norm(p - rig.ik.home_target) * 1000:.1f} mm)")
+
+    tp.toggle_depth()
+    rig.run(1.0, hand(size=0.12))
+    x0 = rig.sim.ee_pos[0]
+    p = rig.run(2.0, hand(size=0.18))
+    check("depth estimate: bigger hand -> forward (+X)", p[0] - x0 > 0.03, f"(dx {p[0] - x0:+.3f} m)")
+
+    check("joints never exceed model limits", rig.limit_violation < 0.02,
+          f"(worst overshoot {rig.limit_violation:.4f} rad)")
+    check("joint speeds stay moderate", rig.max_joint_speed < 6.0, f"(max {rig.max_joint_speed:.2f} rad/s)")
+
+
+def test_snapshots():
+    OUT.mkdir(exist_ok=True)
+    rig = Rig()
+    r = mujoco.Renderer(rig.sim.model, 480, 640)
+    cam = mujoco.MjvCamera()
+    cam.lookat[:] = [0.17, 0, 0.08]
+    cam.distance, cam.azimuth, cam.elevation = 0.85, -20, -30
+    tiles = []
+    for label, fn in [("home", hand()), ("hand left", hand(x=0.3)), ("hand right + up", hand(x=0.7, y=0.35)),
+                      ("pinch (closed)", hand(x=0.7, y=0.35, pinch=0.1))]:
+        rig.run(2.5, fn)
+        rig.sim.set_target_marker(rig.teleop.target)
+        mujoco.mj_forward(rig.sim.model, rig.sim.data)
+        r.update_scene(rig.sim.data, cam)
+        img = cv2.cvtColor(r.render(), cv2.COLOR_RGB2BGR)
+        cv2.putText(img, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        tiles.append(img)
+    path = OUT / "sim_snapshots.png"
+    cv2.imwrite(str(path), np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])]))
+    check("offscreen render", path.exists(), f"({path})")
+
+
+def test_mediapipe():
+    from so101_teleop.config import HandConfig
+    from so101_teleop.hand_tracker import HandTracker
+
+    tracker = HandTracker(HandConfig())
+    blank = np.zeros((360, 640, 3), np.uint8)
+    t0 = time.perf_counter()
+    for _ in range(20):
+        obs, _ = tracker.detect(blank)
+    ms = (time.perf_counter() - t0) / 20 * 1000
+    check("MediaPipe hand model loads and runs", obs is None, f"({ms:.1f} ms per 640x360 frame on CPU)")
+    tracker.close()
+
+
+def test_camera():
+    from so101_teleop.config import HandConfig
+    from so101_teleop.hand_tracker import Camera
+
+    try:
+        cam = Camera(HandConfig())
+    except RuntimeError as e:
+        check("webcam opens", False, str(e))
+        return
+    t0 = time.perf_counter()
+    while cam.latest()[1] is None and time.perf_counter() - t0 < 5:
+        time.sleep(0.05)
+    n0 = cam.latest()[0]
+    time.sleep(2.0)
+    fps = (cam.latest()[0] - n0) / 2.0
+    frame = cam.latest()[1]
+    cam.close()
+    check("webcam delivers frames", frame is not None, f"(resolution {cam.resolution}, ~{fps:.0f} FPS)")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--camera", action="store_true", help="also test webcam 0")
+    args = ap.parse_args()
+    test_model()
+    test_ik_grid()
+    test_pipeline()
+    test_snapshots()
+    test_mediapipe()
+    if args.camera:
+        test_camera()
+    print(f"\n{'ALL CHECKS PASSED' if not failures else f'{len(failures)} CHECK(S) FAILED: {failures}'}")
+    sys.exit(1 if failures else 0)
