@@ -137,17 +137,28 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
         ("Target x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in teleop.target), (255, 255, 255)),
         ("Gripper   x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in sim.ee_pos), (200, 200, 200)),
     ]
-    y = 22
-    for text, color in lines:
-        cv2.putText(img, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(img, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-        y += 20
+    h, w = img.shape[:2]
+    scale = 0.55 * w / 960
+    line_h = int(26 * w / 960)
+    pad = int(8 * w / 960)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_w = max(cv2.getTextSize(t, font, scale, 1)[0][0] for t, _ in lines)
+    shade(img, 0, 0, text_w + 2 * pad, line_h * len(lines) + pad)
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(img, text, (pad, line_h * (i + 1) - pad // 2), font, scale, color, 1, cv2.LINE_AA)
+
     help_text = "Q quit  SPACE pause  C calibrate  R home  F depth  +/- sensitivity"
     if mode == "keyboard":
         help_text += "  | WASD move  E/X fwd/back  G grip  H hide hand"
-    h = img.shape[0]
-    cv2.putText(img, help_text, (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(img, help_text, (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    help_scale = 0.85 * scale
+    shade(img, 0, h - line_h - pad, w, h)
+    cv2.putText(img, help_text, (pad, h - pad - line_h // 4), font, help_scale, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def shade(img, x0, y0, x1, y1, alpha=0.55):
+    """Darken a rectangle so text on top stays readable over any background."""
+    roi = img[max(y0, 0):y1, max(x0, 0):x1]
+    roi[:] = (roi * (1 - alpha)).astype(np.uint8)
 
 
 def parse_args():
@@ -186,11 +197,11 @@ def main():
     teleop.sensitivity = args.sensitivity
     source = WebcamSource(cfg.hand) if args.input == "webcam" else VirtualHandSource(args.input)
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    # AUTOSIZE shows the image 1:1, so overlay text is drawn at screen resolution and stays sharp.
+    cv2.namedWindow(WINDOW, cv2.WINDOW_AUTOSIZE)
     screen_w = ctypes.windll.user32.GetSystemMetrics(0) if sys.platform == "win32" else 1920
-    win_w = min(960, screen_w // 2 - 20)
-    cv2.resizeWindow(WINDOW, win_w, win_w * 9 // 16)
-    cv2.moveWindow(WINDOW, screen_w - win_w - 20, 40)  # MuJoCo opens on the left, webcam on the right
+    display_w = min(960, screen_w // 2 - 20)
+    cv2.moveWindow(WINDOW, screen_w - display_w - 20, 40)  # MuJoCo opens on the left, webcam on the right
     gripper_cmd = cfg.robot.gripper_open
     cam_fps, last_frame_t = 0.0, None
     n_frames = n_hand = n_ticks = 0
@@ -219,10 +230,12 @@ def main():
                 teleop.observe(obs)
                 n_frames += 1
                 n_hand += obs is not None
+                zoom = display_w / frame.shape[1]
+                view = cv2.resize(frame, (display_w, round(frame.shape[0] * zoom)), interpolation=cv2.INTER_LINEAR)
                 if px is not None:
-                    source.draw_hand(frame, px, teleop.gripper.closed)
-                draw_hud(frame, teleop, sim, cfg.mapping, cam_fps, args.input)
-                cv2.imshow(WINDOW, frame)
+                    source.draw_hand(view, px * zoom, teleop.gripper.closed)
+                draw_hud(view, teleop, sim, cfg.mapping, cam_fps, args.input)
+                cv2.imshow(WINDOW, view)
 
             target = teleop.step(dt)
             arm_q = ik.solve(target, dt)
