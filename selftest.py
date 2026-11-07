@@ -330,6 +330,104 @@ def test_mediapipe():
           f"(straight {np.round(straight, 2)}, fist {np.round(fist, 2)})")
 
 
+def test_arm_tools():
+    """Physical-arm tools against the simulated bus (no hardware needed)."""
+    from so101_real import calibration as calib
+    from so101_real.bus import MIDDLE, BusError, FakeBus, decode, encode
+
+    check("arm: sign-magnitude encoding round-trips (offsets -2047..2047)",
+          all(decode(encode(v, 11), 11) == v for v in range(-2047, 2048)) and encode(-5, 11) == 2048 + 5)
+
+    ids = list(calib.JOINTS.values())
+    bus = FakeBus()  # horns at random angles: several joints' travel runs across the 4095 -> 0 wrap
+    check("arm: scan finds the six motors", sorted(bus.scan()) == ids)
+    bus.torque(1, True)
+    bus.write(1, "Min_Position_Limit", 100)
+    check("arm: EEPROM writes stick and leave the motor limp",
+          bus.read(1, "Min_Position_Limit") == 100 and bus.read(1, "Torque_Enable") == 0)
+    bus.write(1, "Min_Position_Limit", 0)
+
+    calib.reset(bus, ids)
+    rec = calib.RangeRecorder(ids)
+    for i in ids:
+        lo, hi = bus.stops[i]
+        for raw in np.linspace(lo - 50, hi + 50, 60):
+            bus.move_by_hand(i, raw)
+            rec.update({i: bus.read(i, "Present_Position")})
+        bus.move_by_hand(i, (lo + hi) / 2)
+    crosses = {i for i, (lo, hi) in bus.stops.items() if lo < 0 or hi > 4095}
+    check("arm: without centring, every joint whose travel crosses 4095/0 is caught",
+          rec.wrapped == crosses and 5 in crosses, f"(wrapped {sorted(rec.wrapped)}, expected {sorted(crosses)})")
+
+    offsets = calib.center(bus, ids)
+    reads = [bus.read(i, "Present_Position") for i in ids]
+    check("arm: centring makes the middle pose read 2047 on every motor", all(abs(r - MIDDLE) <= 1 for r in reads),
+          f"(offsets {offsets})")
+    rec = calib.RangeRecorder(ids)
+    for i in ids:
+        lo, hi = bus.stops[i]
+        for raw in np.linspace(lo - 50, hi + 50, 60):  # pushing past the stops does nothing
+            bus.move_by_hand(i, raw)
+            rec.update({i: bus.read(i, "Present_Position")})
+    margin = 34  # 3 deg
+    limits, problems = calib.limits_from_recording(rec, margin)
+    expected = {i: (round(lo - offsets[i]) + margin, round(hi - offsets[i]) - margin) for i, (lo, hi) in bus.stops.items()}
+    check("arm: recorded limits = the hard stops pulled in by the margin, no wrap after centring",
+          not problems and all(abs(limits[i][0] - expected[i][0]) <= 1 and abs(limits[i][1] - expected[i][1]) <= 1
+                               for i in ids), f"({problems or limits[5]})")
+    calib.write_limits(bus, limits)
+    cal = {n: calib.JointCalibration(i, 0, offsets[i], *limits[i]) for n, i in calib.JOINTS.items()}
+    check("arm: servos match the calibration", calib.check(bus, cal) == [])
+
+    i = 3
+    bus.move_by_hand(i, (bus.stops[i][0] + bus.stops[i][1]) / 2)
+    bus.write(i, "Goal_Position", 0)  # a stale goal, far outside the limits
+    bus.torque(i, True)
+    time.sleep(0.05)
+    still = abs(bus.read(i, "Present_Position") - MIDDLE) < 5
+    bus.write(i, "Goal_Position", 4095)
+    for _ in range(40):
+        bus.read(i, "Present_Position")
+        time.sleep(0.01)
+    check("arm: torque-on holds the pose (ignores a stale goal); a goal past the limit stops at the limit",
+          still and bus.read(i, "Present_Position") == limits[i][1], f"(at {bus.read(i, 'Present_Position')}, "
+                                                                        f"max {limits[i][1]})")
+    bus.torque_off(i)
+
+    i = 2
+    bus.move_by_hand(i, bus.stops[i][1] + 100)  # resting on its end stop, past the margin
+    try:
+        bus.torque(i, True)
+        refused = False
+    except BusError:
+        refused = True
+    bus.torque(i, True, max_snap=60)
+    for _ in range(40):
+        bus.read(i, "Present_Position")
+        time.sleep(0.01)
+    check("arm: torque-on is refused outside the limits; jog's small ease-in moves it to the limit",
+          refused and bus.read(i, "Present_Position") == limits[i][1], f"(at {bus.read(i, 'Present_Position')})")
+    bus.torque_off(i)
+    odd = FakeBus(raw={1: 3877})  # like a real scan: old limits 3997..2278 (min above max)
+    odd.mem[1][9], odd.mem[1][11] = 3997, 2278
+    try:
+        odd.torque(1, True)
+        refused = False
+    except BusError:
+        refused = True
+    check("arm: torque-on is refused when the stored limits are nonsense (min above max)", refused)
+
+    rec = calib.RangeRecorder([1])
+    rec.update({1: 2000})
+    rec.update({1: 2100})
+    _, problems = calib.limits_from_recording(rec, margin)
+    check("arm: a joint that was barely moved is not saved", len(problems) == 1)
+
+    bus = FakeBus(raw={1: 2000})
+    bus.change_id(1, 4)
+    check("arm: changing a motor's ID", sorted(bus.scan()) == [4])
+
+
 def test_camera():
     from so101_teleop.config import HandConfig
     from so101_teleop.hand_tracker import Camera
@@ -360,6 +458,7 @@ if __name__ == "__main__":
         test_pipeline(mode)
     test_snapshots()
     test_mediapipe()
+    test_arm_tools()
     if args.camera:
         test_camera()
     print(f"\n{'ALL CHECKS PASSED' if not failures else f'{len(failures)} CHECK(S) FAILED: {failures}'}")

@@ -284,27 +284,95 @@ Still needs you, in front of the camera:
   ROS 2 and TCP under WSL, so none of its code is used; this project replaces that with one native
   Python process.
 
-## 8. Moving to the physical SO-ARM101 later (not implemented)
+## 8. The physical SO-ARM101: motor setup, safe limits, jogging (`arm.py`)
 
-The output of this app each tick is `arm_q` (5 joint angles in radians, in the model's "new calib"
+`arm.py` talks to the real follower arm's six Feetech STS3215 servos through the bus adapter board.
+`main.py` doesn't use it yet; the hand-tracking app is still simulation only. Every command also
+runs with `--fake` (a simulated arm with its own files in `calibration/fake_arm/`), so you can try
+the steps first.
+
+**Why limits matter here:** the servo horns were fitted at random angles, so a raw reading says
+nothing about where a joint's mechanical stops are. A joint's travel can even cross the encoder's
+4095 -> 0 wrap, where a naive program would think it jumped a full turn and drive it the wrong way
+into a stop. Calibration fixes both, the way LeRobot does:
+
+1. With every joint at roughly the middle of its travel, each servo's `Homing_Offset` is set so that
+   pose reads 2047 (the middle of 0..4095). Each joint's travel is then one continuous range around
+   2047, far from the wrap. A guess within about 90° of the true middle is fine.
+2. You move each joint by hand to both end stops. The extremes, pulled 3° in (`--margin-deg`),
+   are written to the servo's own `Min_Position_Limit` / `Max_Position_Limit` (EEPROM, kept when
+   powered off). The servo then refuses goals outside them, whatever program sends them.
+3. The values are saved to `calibration/so101_follower.json`, in LeRobot's calibration format.
+
+**Steps:**
+
+1. Wire it: 12 V supply to the adapter board (USB only carries data), USB to the PC, and the 3-pin
+   cable from the board to the first motor. `python arm.py ports` should list a COM port. If it
+   doesn't, install the board's USB driver (CH340 or CH343 chip, depending on the board).
+2. `python arm.py scan` lists every motor that answers: ID, position, limits, voltage, temperature.
+   - If only ID 1 answers, the motors are new (they all ship as ID 1). Run
+     `python arm.py setup-ids` and connect one motor at a time when asked; it gives gripper = 6,
+     wrist roll = 5, wrist flex = 4, elbow = 3, shoulder lift = 2, base = 1 (LeRobot's numbering).
+3. `python arm.py identify` keeps torque off and shows every motor's reading live: move a joint by
+   hand and its row shows "moving", so you can check that each ID sits on the joint it should.
+   After calibrating, `python arm.py identify 3 --wiggle` wiggles motor 3 by ±3.5° at 30 % torque.
+   - Before calibration, motors can hold leftover limits that don't fit how the arm was
+     assembled; turning torque on would make the servo swing to the nearest one. Every command
+     refuses to turn torque on for a motor outside its stored limits (jog allows easing in from
+     up to 5° outside, for a joint resting on its end stop).
+4. `python arm.py calibrate`: torque goes off on all motors, so hold the arm. Put every joint at
+   about the middle of its travel and press Enter, then move each joint slowly to both stops while
+   the min/max table fills in, and press Enter. Stop at resistance; don't force it.
+   - It refuses to save if a joint barely moved, or if a reading jumped across 4095/0 (the middle
+     pose was too far off for that joint: run it again).
+5. `python arm.py show` confirms the servos and the file agree.
+6. `python arm.py jog`: torque on, holding the current pose.
+   - `1`-`6` picks a joint, `LEFT` / `RIGHT` (or `A` / `D`) move it, `UP` / `DOWN` change the step
+     (5 to 100 ticks, 0.4° to 9°), `M` sends it to the middle of its range.
+   - `SPACE` freezes everything where it is. `T` turns torque off (limp; hold the arm) and on again.
+     `Q` quits and asks whether to release torque.
+   - Goals are clipped to the calibrated limits, and the servo enforces them again on its side.
+     Speed is capped at 40°/s (`--speed-deg`) and torque at 50 % (`--torque`).
+   - If a joint pushes harder than 60 % load (`--stall-load`) for 0.3 s without getting there,
+     its goal is reset to where it is, so it stops pushing into whatever is in the way.
+   - It won't start if the servos don't match the calibration file (for example a motor was
+     swapped or re-zeroed).
+
+Turning torque on always sets the goal to the current position first, so a motor never jumps to
+an old goal left in its memory.
+
+Tested without hardware against the simulated bus (`selftest.py`): offsets centre every joint at
+2047; joints whose travel crosses the wrap are caught without centring and stay continuous with it;
+the saved limits equal the end stops minus the margin; a goal past a limit stops at the limit;
+EEPROM writes are refused while torque is on; a stale goal doesn't move a motor when torque comes on;
+an unmoved joint isn't saved; ID changes work. Jogging was driven with scripted keys: a joint stops
+at its max, `M` returns it to the middle, and a blocked joint is stopped. None of this has run on
+the real arm yet.
+
+## 9. Driving the physical arm from the hand tracking later (not implemented)
+
+The output of `main.py` each tick is `arm_q` (5 joint angles in radians, in the model's "new calib"
 convention) plus `gripper_cmd` (radians). To drive the real follower arm:
 
-1. Use [LeRobot](https://github.com/huggingface/lerobot)'s `SO101Follower` (Feetech STS3215 bus)
-   instead of writing serial code, and calibrate the arm with LeRobot's calibration tool first.
-2. Convert units. With `use_degrees=True`, LeRobot's arm joints are in degrees
-   (`np.degrees(arm_q)`); otherwise they use a -100..100 scale. Its gripper is 0-100, so map this
-   model's closed (about 0 rad) to open (about 1.745 rad) onto that range, then check
-   the direction and zero offset of each joint against the simulation with `joint_test.py` before
-   enabling torque.
+1. Use the calibration above (`arm.py calibrate`), and map each joint between the simulation's
+   radians and the servo's ticks around 2047 (one tick = 0.088°), checking direction and zero
+   offset joint by joint with `arm.py jog` and `joint_test.py` before enabling torque.
+2. The gripper is different: map this model's closed (about 0 rad) to open (about 1.745 rad)
+   onto the gripper's calibrated min..max ticks. The same file also works with LeRobot's
+   `SO101Follower` if you'd rather use LeRobot for this part.
 3. Send `arm_q` only after the simulation has accepted it, and keep all the limits: joint margins,
    the speed cap, and the workspace box. Start with `--speed 0.1` and lower gains.
 4. Add a hardware e-stop or torque-off key, and rate-limit bus writes to about 30-50 Hz.
 5. Mirror the real joint readings back into the simulation for comparison.
 
-## 9. Files
+## 10. Files
 
 ```
 main.py                    app: two windows, control loop, keys, input modes
+arm.py                     physical arm: ports, scan, setup-ids, identify, calibrate, show, jog
+so101_real/bus.py          STS3215 registers, real serial bus, simulated bus (--fake)
+so101_real/calibration.py  centring, range recording, limits, calibration file
+calibration/               so101_follower.json after you calibrate the real arm
 joint_test.py              milestone 1: jog joints, see ranges
 selftest.py                headless checks (no webcam needed); --camera to test webcam
 setup.ps1                  one-time Windows setup

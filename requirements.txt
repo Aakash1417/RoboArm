@@ -5,3 +5,5 @@ opencv-contrib-python==5.0.0.93  # installed by mediapipe anyway; do not also in
 mink==1.4.0
 daqp==0.11.0                      # QP solver used by mink
 numpy==2.4.6
+feetech-servo-sdk==1.0.0          # physical arm only (arm.py): Feetech STS3215 serial protocol
+pyserial==3.5
