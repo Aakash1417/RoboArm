@@ -79,15 +79,19 @@ class MappingConfig:
     dead_zone: float = 0.004  # normalized image units of hand jitter that are ignored
     depth_dead_zone: float = 0.03
 
-    # Grip ratio = thumb-tip to fingertip distance divided by palm length (wrist to middle-finger base),
-    # measured on MediaPipe's 3D hand landmarks.
-    #   "majority": closes when at least grip_min_fingers of index/middle/ring/pinky touch the thumb,
-    #               and opens once fewer than that are still touching.
+    # Gripper gesture, measured on MediaPipe's 3D hand landmarks.
+    #   "majority": each of index/middle/ring/pinky counts as closed if EITHER
+    #                 - its tip touches the thumb tip: tip distance / palm length < touch_below, OR
+    #                 - it is curled into a fist: tip-to-wrist / knuckle-to-wrist < curl_below.
+    #               The gripper closes when at least grip_min_fingers fingers are closed.
     #   "index":    thumb-index pinch only.
     grip_mode: str = "majority"
-    grip_min_fingers: int = 3  # out of 4 fingertips; 4 = all fingers, 2 = thumb plus any two
-    all_close_below: float = 0.45
-    all_open_above: float = 0.65
+    grip_min_fingers: int = 3  # out of 4; 4 = all fingers, 2 = thumb plus any two
+    touch_below: float = 0.45
+    curl_below: float = 1.0
+    # Per-finger score = min(touch distance / touch_below, curl / curl_below); below 1.0 = closed.
+    # The gripper opens again only once the score rises above open_score (hysteresis).
+    open_score: float = 1.4
     pinch_close_below: float = 0.30
     pinch_open_above: float = 0.45
     pinch_frames: int = 3  # frames the new state must persist before the gripper switches
@@ -95,7 +99,7 @@ class MappingConfig:
     @property
     def grip_thresholds(self):
         if self.grip_mode == "majority":
-            return self.all_close_below, self.all_open_above
+            return 1.0, self.open_score
         return self.pinch_close_below, self.pinch_open_above
 
 

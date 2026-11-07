@@ -19,6 +19,7 @@ HAND_CONNECTIONS = [(c.start, c.end) for c in vision.HandLandmarksConnections.HA
 PALM_POINTS = [0, 5, 9, 13, 17]  # wrist + finger bases: stable while pinching
 THUMB_TIP = 4
 FINGER_TIPS = (8, 12, 16, 20)  # index, middle, ring, pinky
+FINGER_KNUCKLES = (5, 9, 13, 17)  # base knuckle (MCP) of the same fingers
 
 
 def ensure_hand_model():
@@ -120,19 +121,30 @@ def finger_ratios(points):
     return tuple(float(np.linalg.norm(points[THUMB_TIP] - points[tip]) / palm_length) for tip in FINGER_TIPS)
 
 
+def finger_curls(points):
+    """Fingertip-to-wrist distance divided by knuckle-to-wrist distance, per finger.
+    About 1.7-1.9 when the finger is straight, below 1.0 when it is folded into a fist."""
+    return tuple(
+        float(np.linalg.norm(points[tip] - points[0]) / max(np.linalg.norm(points[mcp] - points[0]), 1e-6))
+        for tip, mcp in zip(FINGER_TIPS, FINGER_KNUCKLES)
+    )
+
+
 def observation_from_landmarks(norm, px, width, world=None):
     """world: MediaPipe's 3D hand landmarks in metres. They don't shrink when the hand tilts,
     so finger distances use them when available."""
     palm = norm[PALM_POINTS].mean(axis=0)
     palm_length = np.linalg.norm(px[9] - px[0])  # wrist to middle-finger base
     palm_width = np.linalg.norm(px[17] - px[5])  # index base to pinky base
-    ratios = finger_ratios(world if world is not None else px)
+    pts = world if world is not None else px
+    ratios = finger_ratios(pts)
     return HandObservation(
         x=float(palm[0]), y=float(palm[1]),
         size=float((palm_length + palm_width) / width),
         pinch_ratio=ratios[0],
         finger_ratios=ratios,
         angle=hand_angle(px),
+        finger_curls=finger_curls(pts),
     )
 
 
@@ -144,7 +156,7 @@ def hand_angle(px):
 
 
 def draw_hand(img, px, finger_closed, gripper_closed):
-    """finger_closed: one bool per finger (index..pinky), True when that fingertip is at the thumb."""
+    """finger_closed: one bool per finger (index..pinky), True when that finger counts as closed."""
     pts = px.astype(int)
     for a, b in HAND_CONNECTIONS:
         cv2.line(img, tuple(pts[a]), tuple(pts[b]), (255, 255, 255), 2, cv2.LINE_AA)

@@ -102,7 +102,7 @@ class VirtualHandSource:
         tip = (int(c[0] + r * math.sin(self.angle)), int(c[1] - r * math.cos(self.angle)))
         cv2.line(frame, c, tip, (255, 255, 255), 2, cv2.LINE_AA)  # "fingers" direction
         r = 0.1 if self.pinched else 0.8
-        obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r), self.angle)
+        obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r), self.angle, (1.8,) * 4)
         return frame, obs, None
 
     def handle_key(self, key):
@@ -141,8 +141,9 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
         (f"Grip ratio ({f'{mcfg.grip_min_fingers} of 4 fingers' if mcfg.grip_mode == 'majority' else 'index pinch'}):"
          f" {teleop.last_pinch:.2f}"
          f"  (close<{mcfg.grip_thresholds[0]:.2f} open>{mcfg.grip_thresholds[1]:.2f})", (255, 255, 255)),
-        ("Thumb to  " + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"),
-                                                                teleop.last_fingers)), (200, 200, 200)),
+        (("Finger scores (closed<1): " if mcfg.grip_mode == "majority" else "Thumb to: ")
+         + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"), teleop.last_fingers)),
+         (200, 200, 200)),
         (f"Camera FPS: {cam_fps:4.1f}   Sensitivity: x{teleop.sensitivity:.2f}", (255, 255, 255)),
         (f"Depth (forward/back): {'ON - ESTIMATE from hand size' if mcfg.depth_enabled else 'OFF'}",
          (255, 255, 0) if mcfg.depth_enabled else (180, 180, 180)),
@@ -258,7 +259,7 @@ def main():
                 view = cv2.resize(frame, (display_w, round(frame.shape[0] * zoom)), interpolation=cv2.INTER_LINEAR)
                 if px is not None:
                     close_below = cfg.mapping.grip_thresholds[0]
-                    fingers = [r < close_below for r in obs.finger_ratios]
+                    fingers = [s < close_below for s in teleop.last_fingers]
                     if cfg.mapping.grip_mode != "majority":
                         fingers = fingers[:1]
                     source.draw_hand(view, px * zoom, fingers, teleop.gripper.closed)

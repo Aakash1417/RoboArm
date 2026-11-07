@@ -70,9 +70,9 @@ class Rig:
         return self.sim.ee_pos
 
 
-def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None, angle=0.0):
+def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None, angle=0.0, curls=(1.8,) * 4):
     fingers = fingers or (pinch,) * 4
-    return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers), angle)
+    return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers), angle, tuple(curls))
 
 
 def test_model():
@@ -138,6 +138,19 @@ def test_pipeline():
     rig.run(1.0, hand(fingers=(0.1, 0.9, 0.9, 0.1)))
     check("majority grip: 2 of 4 fingertips stays open, any 3 of 4 closes, back to 2 opens",
           two_open and three_closed and not tp.gripper.closed)
+
+    rig.run(1.0, hand(fingers=(0.9,) * 4, curls=(0.6,) * 4))
+    fist = tp.gripper.closed
+    rig.run(1.0, hand())
+    reopened = not tp.gripper.closed
+    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.9, 0.9), curls=(1.8, 1.8, 0.7, 1.8)))
+    mixed = tp.gripper.closed
+    rig.run(1.0, hand())
+    rig.run(1.0, hand(fingers=(0.9,) * 4, curls=(1.2,) * 4))
+    half_bent = not tp.gripper.closed
+    check("fist closes, open hand reopens, 2 touching + 1 curled closes, half-bent fingers stay open",
+          fist and reopened and mixed and half_bent)
+    rig.run(1.0, hand())
 
     flicker = iter([0.1, 0.8, 0.1, 0.8, 0.55, 0.55, 0.55] * 50)
     rig.run(1.0, lambda t: HandObservation(0.5, 0.5, 0.12, r := next(flicker), (r,) * 4))
@@ -267,6 +280,19 @@ def test_mediapipe():
     check("finger ratios: bunched fingertips small, extended pinky large",
           max(ratios) < 0.4 and finger_ratios(pts)[3] > 0.7,
           f"(bunched {np.round(ratios, 2)}, pinky out {finger_ratios(pts)[3]:.2f})")
+
+    from so101_teleop.hand_tracker import FINGER_KNUCKLES, finger_curls
+
+    pts = np.zeros((21, 3))  # wrist at the origin, fingers pointing +Y
+    for i, (mcp, tip) in enumerate(zip(FINGER_KNUCKLES, FINGER_TIPS)):
+        pts[mcp] = [0.02 * i - 0.03, 0.09, 0]
+        pts[tip] = pts[mcp] + [0, 0.075, 0]  # straight finger
+    straight = finger_curls(pts)
+    for mcp, tip in zip(FINGER_KNUCKLES, FINGER_TIPS):
+        pts[tip] = pts[mcp] + [0, -0.035, 0.02]  # folded back into the palm
+    fist = finger_curls(pts)
+    check("finger curls: straight fingers large, fist small", min(straight) > 1.5 and max(fist) < 0.8,
+          f"(straight {np.round(straight, 2)}, fist {np.round(fist, 2)})")
 
 
 def test_camera():

@@ -15,21 +15,29 @@ class HandObservation:
     pinch_ratio: float  # thumb-index distance / palm length; small = pinched
     finger_ratios: tuple = ()  # thumb to index, middle, ring, pinky tips / palm length
     angle: float = 0.0  # hand twist in radians: 0 = fingers up, positive = clockwise as you see it
+    finger_curls: tuple = ()  # fingertip-to-wrist / knuckle-to-wrist, per finger; small = curled
 
 
 def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+def finger_scores(obs: HandObservation, cfg: MappingConfig) -> tuple:
+    """Per finger: below 1.0 when the tip touches the thumb or the finger is curled into a fist."""
+    curls = obs.finger_curls or (np.inf,) * len(obs.finger_ratios)
+    return tuple(min(t / cfg.touch_below, c / cfg.curl_below) for t, c in zip(obs.finger_ratios, curls))
+
+
 def grip_ratio(obs: HandObservation, cfg: MappingConfig) -> float:
     """The single number the gripper thresholds are applied to.
 
-    In majority mode this is the k-th closest fingertip (k = grip_min_fingers): it is below the
-    close threshold exactly when at least k fingertips are at the thumb.
+    In majority mode this is the k-th lowest finger score (k = grip_min_fingers): it is below 1.0
+    exactly when at least k fingers are closed.
     """
     if cfg.grip_mode == "majority" and obs.finger_ratios:
-        k = int(np.clip(cfg.grip_min_fingers, 1, len(obs.finger_ratios)))
-        return sorted(obs.finger_ratios)[k - 1]
+        scores = finger_scores(obs, cfg)
+        k = int(np.clip(cfg.grip_min_fingers, 1, len(scores)))
+        return sorted(scores)[k - 1]
     return obs.pinch_ratio
 
 
@@ -138,7 +146,7 @@ class Teleop:
             return
 
         self.last_pinch = grip_ratio(obs, self.cfg)
-        self.last_fingers = obs.finger_ratios
+        self.last_fingers = finger_scores(obs, self.cfg) if self.cfg.grip_mode == "majority" else obs.finger_ratios
         self.hand_angle = obs.angle
         meas = np.array([obs.x, obs.y, np.log(max(obs.size, 1e-4)), obs.angle])
         if self._ema is None:
