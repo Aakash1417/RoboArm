@@ -70,10 +70,23 @@ class MappingConfig:
     dead_zone: float = 0.004  # normalized image units of hand jitter that are ignored
     depth_dead_zone: float = 0.03
 
-    # Pinch ratio = thumb-tip/index-tip distance divided by palm size.
+    # Grip ratio = thumb-tip to fingertip distance divided by palm length (wrist to middle-finger base),
+    # measured on MediaPipe's 3D hand landmarks.
+    #   "all":   uses the FARTHEST of index/middle/ring/pinky, so the gripper only closes when every
+    #            fingertip is brought to the thumb, and opens as soon as any finger moves away.
+    #   "index": thumb-index pinch only.
+    grip_mode: str = "all"
+    all_close_below: float = 0.45
+    all_open_above: float = 0.65
     pinch_close_below: float = 0.30
     pinch_open_above: float = 0.45
     pinch_frames: int = 3  # frames the new state must persist before the gripper switches
+
+    @property
+    def grip_thresholds(self):
+        if self.grip_mode == "all":
+            return self.all_close_below, self.all_open_above
+        return self.pinch_close_below, self.pinch_open_above
 
 
 @dataclass

@@ -1,10 +1,12 @@
 # Hand-controlled SO-ARM101 simulation (Windows, no ROS)
 
 Move your hand in front of an ordinary webcam and a simulated SO-101 (SO-ARM101 follower) arm
-follows it in MuJoCo. Pinch thumb and index finger to close the gripper.
+follows it in MuJoCo. Bring all four fingertips to your thumb to close the gripper
+(or use `--grip index` for a simple thumb-index pinch).
 
-- **Window 1 - Hand Tracking (OpenCV):** mirrored webcam feed, MediaPipe hand landmarks, pinch line,
-  tracking status, gripper state, pinch ratio, FPS, target position.
+- **Window 1 - Hand Tracking (OpenCV):** mirrored webcam feed, MediaPipe hand landmarks, a line
+  from the thumb to each fingertip (red = touching), tracking status, gripper state, grip ratios,
+  FPS, target position.
 - **Window 2 - MuJoCo:** the official SO-101 3D model on a table with a small blue cube. The
   translucent red ball is the point your hand is commanding.
 
@@ -38,6 +40,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe main.py --camera 1          # a different webcam
 .\.venv\Scripts\python.exe main.py --input keyboard    # no webcam: WASD moves a virtual hand
 .\.venv\Scripts\python.exe main.py --input synthetic   # no webcam: scripted demo motion
+.\.venv\Scripts\python.exe main.py --grip index        # close on thumb-index pinch only
 .\.venv\Scripts\python.exe joint_test.py               # jog each joint by keyboard (milestone 1 check)
 ```
 
@@ -60,7 +63,7 @@ Useful options: `--sensitivity 1.5`, `--smoothing 0.2` (lower = smoother, laggie
 | `R` | Return smoothly to the home pose, then re-calibrate |
 | `F` | Toggle forward/back control from hand size (**an estimate, not real depth**) |
 | `+` / `-` | Increase / decrease sensitivity |
-| `W A S D`, `E` / `X`, `G`, `H` | Keyboard mode only: move, forward/back, toggle pinch, hide hand |
+| `W A S D`, `E` / `X`, `G`, `H` | Keyboard mode only: move, forward/back, toggle grip, hide hand |
 
 In the MuJoCo window: left-drag rotates, right-drag pans, scroll zooms, double-click selects a body.
 The MuJoCo window has its own built-in shortcuts, so use the Hand Tracking window for the keys above.
@@ -70,8 +73,8 @@ The MuJoCo window has its own built-in shortcuts, so use the Hand Tracking windo
 | Moves left / right | Gripper moves left / right |
 | Moves up / down | Gripper moves up / down |
 | Moves toward / away from the camera (with `F`) | Gripper moves forward / back (estimated) |
-| Thumb and index pinch | Gripper closes |
-| Fingers apart | Gripper opens |
+| All four fingertips touching the thumb | Gripper closes |
+| Any finger moves away from the thumb | Gripper opens |
 | Leaves the view | Robot holds its current position and gripper state |
 
 The MuJoCo camera starts behind the robot, so "left" on your screen, "left" for your hand and the
@@ -81,7 +84,7 @@ robot's own left all agree. If you orbit the camera to the front, the robot will
 
 ```
 webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker (CPU)
-   -> palm centre, palm size, pinch ratio -> smoothing + dead zone -> relative mapping
+   -> palm centre, palm size, thumb-to-fingertip ratios -> smoothing + dead zone -> relative mapping
    -> speed limit + workspace clamp -> 3D target point -> Mink IK (joint limits, velocity limits)
    -> MuJoCo position actuators -> physics -> viewer
 ```
@@ -104,10 +107,17 @@ webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker
   (`dead_zone`). The dead zone ignores tiny jitter without causing steps. On top of that, the target
   point can't move faster than `max_target_speed` (0.35 m/s), so re-acquiring the hand far away, or
   pressing `R`, produces a gradual, bounded motion.
-- **Gripper:** pinch ratio = thumb-tip to index-tip distance ÷ wrist to middle-finger-base distance,
-  so it doesn't depend on how far your hand is from the camera. It closes below 0.30 and opens
-  above 0.45 (hysteresis), and a change must persist for 3 frames. The gripper joint then ramps at
-  4 rad/s.
+- **Gripper:** for each of index, middle, ring and pinky, the ratio is the thumb-tip to fingertip
+  distance ÷ the wrist to middle-finger-base distance. Distances come from MediaPipe's 3D hand
+  landmarks, so they don't depend on how far your hand is from the camera, and tilting your hand
+  doesn't make fingers look closer than they are.
+  - In the default `all` mode, the largest of the four ratios is used. The gripper closes only when
+    every fingertip is near the thumb (largest ratio below 0.45), and opens as soon as any finger
+    moves away (above 0.65).
+  - `--grip index` uses the thumb-index ratio alone (closes below 0.30, opens above 0.45).
+  - In both modes, a change must persist for 3 frames. The gripper joint then ramps at 4 rad/s.
+  - This adds four distance calculations per frame on top of MediaPipe, so there's no measurable
+    cost.
 - **Gripper values** come from the MuJoCo model, not LeRobot's 0-100 scale. The `gripper` joint
   range is -0.175 to 1.745 rad, and larger values mean more open. The app uses 1.2 rad for open and
   -0.1 rad for closed; the slight squeeze helps hold the cube.
@@ -120,8 +130,10 @@ All tunables live in `so101_teleop/config.py`: gains, thresholds, home pose, wor
 
 1. Sit about 50-80 cm from the camera, with your palm facing it and roughly in the middle of the image.
 2. Press `C`. Small hand movements should now produce small robot movements around its current pose.
-3. Watch `Pinch ratio` in the overlay. Open-hand values should be well above 0.45, and pinched values
-   well below 0.30. If not, edit `pinch_close_below` and `pinch_open_above` in `config.py`.
+3. Watch `Grip ratio` and the per-finger `Thumb to` values in the overlay. With all fingertips on
+   your thumb, every value should be below 0.45; with your hand open, the grip ratio should be well
+   above 0.65. If not, edit `all_close_below` and `all_open_above` in `config.py`. If the pinky
+   can't reach comfortably, raise `all_close_below` a little (for example 0.5).
 4. If the motion is too twitchy, lower `--smoothing` (for example 0.2) or raise `dead_zone`. If it's
    too laggy, raise `--smoothing` (for example 0.5).
 5. If your movements feel too small or too big, use `+` / `-`, or `--sensitivity`.
@@ -134,7 +146,8 @@ All tunables live in `so101_teleop/config.py`: gains, thresholds, home pose, wor
 | Webcam takes ~20 s to open | Make sure you start via `main.py`, which sets `OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS=0` before OpenCV loads. |
 | Low camera FPS (about 5-10) | `--backend dshow` often falls back to uncompressed video at 1080p. Use the default `msmf`, or `--width 1280 --height 720`. Low room light also lowers webcam FPS through auto-exposure, so add light. |
 | Hand flickers or is often lost | Add light, use a plain background, keep the whole hand in frame, and move a bit slower. |
-| Gripper toggles unexpectedly | Raise `pinch_frames` or widen the gap between the two pinch thresholds in `config.py`. |
+| Gripper toggles unexpectedly | Raise `pinch_frames` or widen the gap between the close and open thresholds in `config.py`. |
+| Gripper won't close in `all` mode | Check which finger's value stays high in the overlay (often the pinky), and raise `all_close_below`. Or use `--grip index`. |
 | Robot drifts toward an edge | Press `C` with your hand at a comfortable centre, or `R` to go home. |
 | Keys do nothing | Click the Hand Tracking window. Keys typed into the MuJoCo window go to MuJoCo. |
 | MuJoCo window is black or crashes | Update the NVIDIA driver. MuJoCo needs OpenGL 1.5+. |
@@ -151,7 +164,9 @@ Tested automatically (`selftest.py`, all passing):
 - The full control loop with MuJoCo physics, driven by scripted hand readings:
   - Hand left/right/up/down moves the gripper left/right/up/down.
   - Calibrating doesn't move the robot.
-  - Pinch closes the gripper and opening releases it, and single-frame pinch flicker is ignored.
+  - All four fingertips to the thumb closes the gripper. Three of four keeps it open, lifting any
+    one finger opens it, and single-frame flicker is ignored. `--grip index` closes on the
+    thumb-index pinch alone.
   - Losing the hand holds position (0 mm drift over 3 s).
   - Re-acquiring the hand far away stays at or below the 0.35 m/s speed cap.
   - Extreme hand positions stay inside the workspace.
@@ -169,7 +184,8 @@ Tested by running the app:
   closes. `selftest.py` writes these to `selftest_output/sim_snapshots.png`.
 
 Still needs you, in front of the camera:
-- Checking that the pinch thresholds suit your hand. The ratio is shown live; tune in `config.py`.
+- Checking that the all-fingers thresholds (0.45 / 0.65) suit your hand. They're set from typical
+  hand proportions, not measured on a real hand. The values are shown live; tune in `config.py`.
 - Checking how natural it feels, including gains and smoothing.
 - Trying the depth estimate. It's off by default because hand-size depth is noisy.
 - Picking up the cube. Contact grasping with the mesh-based jaw collisions works only sometimes;

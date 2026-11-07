@@ -13,6 +13,14 @@ class HandObservation:
     y: float            # palm centre, 0..1 down the image, 0 = top
     size: float         # apparent palm size (fraction of image width); grows as the hand nears the camera
     pinch_ratio: float  # thumb-index distance / palm length; small = pinched
+    finger_ratios: tuple = ()  # thumb to index, middle, ring, pinky tips / palm length
+
+
+def grip_ratio(obs: HandObservation, mode: str) -> float:
+    """The single number the gripper thresholds are applied to."""
+    if mode == "all" and obs.finger_ratios:
+        return max(obs.finger_ratios)
+    return obs.pinch_ratio
 
 
 class GripperHysteresis:
@@ -23,10 +31,11 @@ class GripperHysteresis:
         self.closed = False
         self._count = 0
 
-    def update(self, pinch_ratio):
-        if pinch_ratio < self.cfg.pinch_close_below:
+    def update(self, ratio):
+        close_below, open_above = self.cfg.grip_thresholds
+        if ratio < close_below:
             want = True
-        elif pinch_ratio > self.cfg.pinch_open_above:
+        elif ratio > open_above:
             want = False
         else:
             want = self.closed
@@ -60,6 +69,7 @@ class Teleop:
         self.tracking = False
         self.sensitivity = 1.0
         self.last_pinch = float("nan")
+        self.last_fingers = ()
         self._needs_calibration = True
         self._ema = None
         self._filtered = None
@@ -100,7 +110,8 @@ class Teleop:
                 self.goal = self.target.copy()
             return
 
-        self.last_pinch = obs.pinch_ratio
+        self.last_pinch = grip_ratio(obs, self.cfg.grip_mode)
+        self.last_fingers = obs.finger_ratios
         meas = np.array([obs.x, obs.y, np.log(max(obs.size, 1e-4))])
         if self._ema is None:
             self._ema = meas.copy()
@@ -114,7 +125,7 @@ class Teleop:
 
         if self.paused:
             return
-        self.gripper.update(obs.pinch_ratio)
+        self.gripper.update(self.last_pinch)
         if self.homing:
             return
 

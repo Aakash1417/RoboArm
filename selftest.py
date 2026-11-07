@@ -68,8 +68,9 @@ class Rig:
         return self.sim.ee_pos
 
 
-def hand(x=0.5, y=0.5, size=0.12, pinch=0.8):
-    return lambda t: HandObservation(x, y, size, pinch)
+def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None):
+    fingers = fingers or (pinch,) * 4
+    return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers))
 
 
 def test_model():
@@ -124,12 +125,27 @@ def test_pipeline():
     g_closed = rig.sim.joint_q[5]
     rig.run(1.0, hand(pinch=0.8))
     g_open = rig.sim.joint_q[5]
-    check("pinch closes and opening releases gripper", tp.gripper.closed is False and g_closed < 0.1 < 1.0 < g_open,
+    check("all fingers to thumb closes, opening releases gripper",
+          tp.gripper.closed is False and g_closed < 0.1 < 1.0 < g_open,
           f"(closed {g_closed:+.2f} rad, open {g_open:+.2f} rad)")
 
-    flicker = iter([0.1, 0.8, 0.1, 0.8, 0.37, 0.37, 0.37] * 50)
-    rig.run(1.0, lambda t: HandObservation(0.5, 0.5, 0.12, next(flicker)))
-    check("gripper ignores single-frame pinch flicker", tp.gripper.closed is False)
+    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.1, 0.9)))
+    stayed_open = not tp.gripper.closed
+    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.1, 0.1)))
+    now_closed = tp.gripper.closed
+    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.9, 0.1)))
+    check("gripper needs every finger: 3 of 4 stays open, 4 of 4 closes, lifting one opens",
+          stayed_open and now_closed and not tp.gripper.closed)
+
+    flicker = iter([0.1, 0.8, 0.1, 0.8, 0.55, 0.55, 0.55] * 50)
+    rig.run(1.0, lambda t: HandObservation(0.5, 0.5, 0.12, r := next(flicker), (r,) * 4))
+    check("gripper ignores single-frame flicker", tp.gripper.closed is False)
+
+    tp.cfg.grip_mode = "index"
+    rig.run(1.0, hand(fingers=(0.1, 0.9, 0.9, 0.9)))
+    check("--grip index mode: thumb-index pinch alone closes", tp.gripper.closed)
+    rig.run(1.0, hand())
+    tp.cfg.grip_mode = "all"
 
     rig.run(0.5, hand(x=0.4, y=0.45))
     before = rig.sim.ee_pos
@@ -209,6 +225,19 @@ def test_mediapipe():
     ms = (time.perf_counter() - t0) / 20 * 1000
     check("MediaPipe hand model loads and runs", obs is None, f"({ms:.1f} ms per 640x360 frame on CPU)")
     tracker.close()
+
+    from so101_teleop.hand_tracker import FINGER_TIPS, THUMB_TIP, finger_ratios
+
+    pts = np.zeros((21, 3))
+    pts[9] = [0, 0.09, 0]  # palm length 9 cm
+    pts[THUMB_TIP] = [0.03, 0.12, 0.02]
+    for tip, dx in zip(FINGER_TIPS, (0.01, 0.015, 0.02, 0.03)):
+        pts[tip] = pts[THUMB_TIP] + [dx, 0, 0]
+    ratios = finger_ratios(pts)
+    pts[20] = [-0.04, 0.17, 0]  # pinky straightened out
+    check("finger ratios: bunched fingertips small, extended pinky large",
+          max(ratios) < 0.4 and finger_ratios(pts)[3] > 0.7,
+          f"(bunched {np.round(ratios, 2)}, pinky out {finger_ratios(pts)[3]:.2f})")
 
 
 def test_camera():

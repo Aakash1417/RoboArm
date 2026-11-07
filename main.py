@@ -97,7 +97,8 @@ class VirtualHandSource:
         r = int(self.size * 640 / 2)
         cv2.circle(frame, c, r, (0, 0, 255) if self.pinched else (0, 255, 0), 2, cv2.LINE_AA)
         cv2.drawMarker(frame, c, (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
-        obs = HandObservation(self.x, self.y, self.size, 0.1 if self.pinched else 0.8)
+        r = 0.1 if self.pinched else 0.8
+        obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r))
         return frame, obs, None
 
     def handle_key(self, key):
@@ -129,8 +130,10 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
         (f"Status: {teleop.status}", (0, 255, 0) if teleop.status == "TRACKING" else (0, 200, 255)),
         (f"Gripper: {'CLOSED' if teleop.gripper.closed else 'OPEN'}",
          (0, 0, 255) if teleop.gripper.closed else (0, 255, 0)),
-        (f"Pinch ratio: {teleop.last_pinch:.2f}  (close<{mcfg.pinch_close_below:.2f} open>{mcfg.pinch_open_above:.2f})",
-         (255, 255, 255)),
+        (f"Grip ratio ({'all fingers' if mcfg.grip_mode == 'all' else 'index pinch'}): {teleop.last_pinch:.2f}"
+         f"  (close<{mcfg.grip_thresholds[0]:.2f} open>{mcfg.grip_thresholds[1]:.2f})", (255, 255, 255)),
+        ("Thumb to  " + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"),
+                                                                teleop.last_fingers)), (200, 200, 200)),
         (f"Camera FPS: {cam_fps:4.1f}   Sensitivity: x{teleop.sensitivity:.2f}", (255, 255, 255)),
         (f"Depth (forward/back): {'ON - ESTIMATE from hand size' if mcfg.depth_enabled else 'OFF'}",
          (255, 255, 0) if mcfg.depth_enabled else (180, 180, 180)),
@@ -174,6 +177,8 @@ def parse_args():
     p.add_argument("--smoothing", type=float, default=None, help="EMA factor 0..1 (lower = smoother)")
     p.add_argument("--speed", type=float, default=None, help="max gripper target speed in m/s")
     p.add_argument("--depth", action="store_true", help="enable forward/back from hand size (estimate)")
+    p.add_argument("--grip", choices=["all", "index"], default="all",
+                   help="close the gripper when all fingertips touch the thumb, or on thumb-index pinch only")
     p.add_argument("--duration", type=float, default=0, help="auto-quit after N seconds (0 = never)")
     return p.parse_args()
 
@@ -186,6 +191,7 @@ def main():
     cfg.hand.request_width, cfg.hand.request_height = args.width, args.height
     cfg.hand.process_width = args.process_width
     cfg.mapping.depth_enabled = args.depth
+    cfg.mapping.grip_mode = args.grip
     if args.smoothing is not None:
         cfg.mapping.smoothing = float(np.clip(args.smoothing, 0.01, 1.0))
     if args.speed is not None:
@@ -233,7 +239,11 @@ def main():
                 zoom = display_w / frame.shape[1]
                 view = cv2.resize(frame, (display_w, round(frame.shape[0] * zoom)), interpolation=cv2.INTER_LINEAR)
                 if px is not None:
-                    source.draw_hand(view, px * zoom, teleop.gripper.closed)
+                    close_below = cfg.mapping.grip_thresholds[0]
+                    fingers = [r < close_below for r in obs.finger_ratios]
+                    if cfg.mapping.grip_mode != "all":
+                        fingers = fingers[:1]
+                    source.draw_hand(view, px * zoom, fingers, teleop.gripper.closed)
                 draw_hud(view, teleop, sim, cfg.mapping, cam_fps, args.input)
                 cv2.imshow(WINDOW, view)
 

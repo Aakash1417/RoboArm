@@ -17,7 +17,8 @@ BACKENDS = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW, "any": cv2.CAP_ANY}
 
 HAND_CONNECTIONS = [(c.start, c.end) for c in vision.HandLandmarksConnections.HAND_CONNECTIONS]
 PALM_POINTS = [0, 5, 9, 13, 17]  # wrist + finger bases: stable while pinching
-THUMB_TIP, INDEX_TIP = 4, 8
+THUMB_TIP = 4
+FINGER_TIPS = (8, 12, 16, 20)  # index, middle, ring, pinky
 
 
 def ensure_hand_model():
@@ -104,31 +105,46 @@ class HandTracker:
         lm = result.hand_landmarks[0]
         norm = np.array([[p.x, p.y] for p in lm])
         px = norm * np.array([w, h])
-        return observation_from_landmarks(norm, px, w), px
+        world = None
+        if result.hand_world_landmarks:
+            world = np.array([[p.x, p.y, p.z] for p in result.hand_world_landmarks[0]])
+        return observation_from_landmarks(norm, px, w, world), px
 
     def close(self):
         self.landmarker.close()
 
 
-def observation_from_landmarks(norm, px, width):
+def finger_ratios(points):
+    """Thumb-tip to each fingertip distance divided by palm length. Works on 2D or 3D points."""
+    palm_length = max(np.linalg.norm(points[9] - points[0]), 1e-6)
+    return tuple(float(np.linalg.norm(points[THUMB_TIP] - points[tip]) / palm_length) for tip in FINGER_TIPS)
+
+
+def observation_from_landmarks(norm, px, width, world=None):
+    """world: MediaPipe's 3D hand landmarks in metres. They don't shrink when the hand tilts,
+    so finger distances use them when available."""
     palm = norm[PALM_POINTS].mean(axis=0)
     palm_length = np.linalg.norm(px[9] - px[0])  # wrist to middle-finger base
     palm_width = np.linalg.norm(px[17] - px[5])  # index base to pinky base
-    pinch = np.linalg.norm(px[THUMB_TIP] - px[INDEX_TIP]) / max(palm_length, 1e-6)
+    ratios = finger_ratios(world if world is not None else px)
     return HandObservation(
         x=float(palm[0]), y=float(palm[1]),
         size=float((palm_length + palm_width) / width),
-        pinch_ratio=float(pinch),
+        pinch_ratio=ratios[0],
+        finger_ratios=ratios,
     )
 
 
-def draw_hand(img, px, pinched):
+def draw_hand(img, px, finger_closed, gripper_closed):
+    """finger_closed: one bool per finger (index..pinky), True when that fingertip is at the thumb."""
     pts = px.astype(int)
     for a, b in HAND_CONNECTIONS:
         cv2.line(img, tuple(pts[a]), tuple(pts[b]), (255, 255, 255), 2, cv2.LINE_AA)
     for p in pts:
         cv2.circle(img, tuple(p), 4, (0, 180, 255), -1, cv2.LINE_AA)
-    color = (0, 0, 255) if pinched else (0, 255, 0)
-    cv2.line(img, tuple(pts[THUMB_TIP]), tuple(pts[INDEX_TIP]), color, 3, cv2.LINE_AA)
+    for tip, closed in zip(FINGER_TIPS, finger_closed):
+        color = (0, 0, 255) if closed else (0, 255, 0)
+        cv2.line(img, tuple(pts[THUMB_TIP]), tuple(pts[tip]), color, 2, cv2.LINE_AA)
+    cv2.circle(img, tuple(pts[THUMB_TIP]), 9, (0, 0, 255) if gripper_closed else (0, 255, 0), 2, cv2.LINE_AA)
     palm = pts[PALM_POINTS].mean(axis=0).astype(int)
     cv2.drawMarker(img, tuple(palm), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
