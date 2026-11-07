@@ -43,6 +43,8 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe main.py --input keyboard    # no webcam: WASD moves a virtual hand
 .\.venv\Scripts\python.exe main.py --input synthetic   # no webcam: scripted demo motion
 .\.venv\Scripts\python.exe main.py --grip index        # close on thumb-index pinch only
+.\.venv\Scripts\python.exe main.py --ik tip            # original motion: all 5 joints, tilt free
+.\.venv\Scripts\python.exe main.py --ik wrist          # hand moves the wrist joint (so101-leap-teleop style)
 .\.venv\Scripts\python.exe joint_test.py               # jog each joint by keyboard (milestone 1 check)
 ```
 
@@ -80,6 +82,7 @@ The MuJoCo window has its own built-in shortcuts, so use the Hand Tracking windo
 | At least 3 of the 4 fingers closed (tip touching the thumb, or curled into a fist, in any mix) | Gripper closes |
 | Two or more fingers open again | Gripper opens |
 | Leaves the view | Robot holds its current position and gripper state |
+| Comes back somewhere else (after about 0.25 s away) | Robot stays put; your hand's new position becomes neutral, like lifting a mouse off the desk |
 
 The MuJoCo camera starts behind the robot, so "left" on your screen, "left" for your hand and the
 robot's own left all agree. If you orbit the camera to the front, the robot will look mirrored.
@@ -89,7 +92,7 @@ robot's own left all agree. If you orbit the camera to the front, the robot will
 ```
 webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker (CPU)
    -> palm centre, palm size, thumb-to-fingertip ratios -> smoothing + dead zone -> relative mapping
-   -> speed limit + workspace clamp -> 3D target point -> Mink IK (joint limits, velocity limits)
+   -> speed limit + workspace clamp -> 3D target point -> split IK (or Mink IK with --ik tip)
    -> MuJoCo position actuators -> physics -> viewer
 ```
 
@@ -100,11 +103,35 @@ webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker
   moving your hand across the full image width moves the gripper about 0.55 m, which is limited by the
   workspace. +Y is the robot's left, +Z is up, +X is forward. Units are metres; the base sits at the
   origin on a table top at Z = 0.
-- **IK:** [Mink](https://github.com/kevinzakka/mink) solves for the 5 arm joints so the model's
-  `gripperframe` site reaches the target point. Only position is controlled. The SO-101 has 5 arm
-  joints, so full 6D pose control isn't always possible. A light posture task keeps the wrist close
-  to its home angle. The joint limits come from the model, with a 0.05 rad margin, and joint speed is
-  capped at 3 rad/s. This is true end-effector control: the gripper moves left, not a single joint.
+- **IK, default `--ik jaws`:** the point between the jaws (the model's `gripperframe` site) follows
+  your hand 1:1, and the gripper keeps the tilt it has in the home pose (pointing down-forward).
+  - Shoulder, elbow and wrist flex all turn about the same axis, so the gripper's tilt in the world
+    is their sum. `wrist_flex` is always set to keep that sum at its home value, and `wrist_roll`
+    follows your twist.
+  - Base, shoulder and elbow are solved with damped least squares to put the jaws on the target,
+    with `wrist_flex` moving along with them. The base is first pointed straight at the target and
+    each correction step is capped, so a far target can't throw the arm into a folded pose.
+  - The tilt holds everywhere except when you push the gripper high and close to the base, where
+    `wrist_flex` reaches its limit and the gripper tilts up a little.
+  - Limits: a box, a reach shell around the shoulder (35-95% of the upper arm plus forearm length),
+    and a floor that keeps the jaws 2 cm above the table. Limits are checked on the wrist position
+    that a jaw target implies, since that's what the reach depends on.
+  - Each joint moves at most 3 rad/s, and the joint limits keep a 0.05 rad margin.
+- **IK, `--ik wrist`:** the same, except the wrist joint follows your hand, as in
+  [so101-leap-teleop](https://github.com/Jordaine777/so101-leap-teleop). That project also tracks
+  hand tilt, and then the gripper pivoting about its wrist like your hand does is the natural
+  choice. Without tilt tracking it's worse: the jaws hang 12.5 cm below and 10 cm in front of the
+  wrist, and at home the wrist is only about 6 cm in front of the base axis. Moving it sideways
+  turns the base a lot, so the jaws swing roughly twice as far as your hand, on a curve, and the
+  red target marker sits at the wrist instead of the jaws.
+- **IK, `--ik tip`** (the previous behaviour): [Mink](https://github.com/kevinzakka/mink) solves
+  for all 5 arm joints so the model's `gripperframe` site reaches the target point. A light posture
+  task keeps the wrist close to its home angle, but the wrist does help with positioning, so the
+  gripper's tilt changes as you move. Same joint margins and speed cap, with the older
+  workspace box from `workspace_min` / `workspace_max`.
+- **Edges:** when the target hits the workspace edge, the neutral point slides with it (also from
+  that repo). Moving your hand back responds immediately, instead of first having to return to
+  where it crossed the edge.
 - **Wrist roll:** the hand twist is the angle of the line from your wrist to your middle-finger
   knuckle in the mirrored image. Those points don't move when you bunch your fingers, so gripping
   doesn't twist the wrist.
@@ -148,8 +175,10 @@ webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker
 - **Gripper values** come from the MuJoCo model, not LeRobot's 0-100 scale. The `gripper` joint
   range is -0.175 to 1.745 rad, and larger values mean more open. The app uses 1.2 rad for open and
   -0.1 rad for closed; the slight squeeze helps hold the cube.
-- **Hand lost:** the target freezes and the arm holds position. When the hand returns, the filter
-  restarts and the arm moves toward the new position at the capped speed.
+- **Hand lost:** the target freezes and the arm holds position. If the hand is back within
+  `reanchor_frames` (8 camera frames, about 0.25 s), the old neutral still applies, so a brief
+  tracking dropout doesn't lose the movement you made during it. After a longer absence, the
+  returning hand re-anchors: wherever it is now maps to where the robot is, so the arm doesn't move.
 
 All tunables live in `so101_teleop/config.py`: gains, thresholds, home pose, workspace box, and speeds.
 
@@ -187,9 +216,10 @@ All tunables live in `so101_teleop/config.py`: gains, thresholds, home pose, wor
 Tested automatically (`selftest.py`, all passing):
 - The official SO-101 model loads. The six actuator ranges match the joint ranges, as listed in the
   self-test output.
-- IK reaches 100 targets across the workspace (median error 0.0 mm, 95th percentile 0.1 mm). Joints
-  stayed within the model limits for every target.
-- The full control loop with MuJoCo physics, driven by scripted hand readings:
+- The jaws and wrist IKs each reach 150 targets across the workspace (worst error 0.1 mm), and the
+  tip IK reaches 100 (95th percentile 0.1 mm). Joints stayed within the model limits for every target.
+- The full control loop with MuJoCo physics, driven by scripted hand readings, once with each of the
+  three IKs (every check below passes in all three):
   - Hand left/right/up/down moves the gripper left/right/up/down.
   - Calibrating doesn't move the robot.
   - Any 3 of the 4 fingertips at the thumb closes the gripper, 2 of 4 keeps it open, dropping back
@@ -197,8 +227,13 @@ Tested automatically (`selftest.py`, all passing):
     closes it, and half-bent fingers don't. `--grip index` closes on the thumb-index
     pinch alone.
   - Losing the hand holds position (0 mm drift over 3 s).
-  - Re-acquiring the hand far away stays at or below the 0.35 m/s speed cap.
-  - Extreme hand positions stay inside the workspace.
+  - A hand that comes back somewhere else after being lost doesn't move the arm. A 3-frame dropout
+    keeps the anchor, so a move made during it still counts.
+  - The target never exceeds the 0.35 m/s speed cap.
+  - Extreme hand positions stay inside the workspace. From the edge, moving back responds right away.
+  - Jaws and wrist IK: the gripper's tilt stays within 0.1° of home, except where `wrist_flex` is
+    at its limit. Jaws (and tip) IK: moving the hand 0.15 image widths left moves the jaws straight
+    left by the matching 8.2 cm, minus the 2.2 mm dead zone.
   - Pause holds, resume doesn't jump, and `R` returns home.
   - A clockwise hand twist turns `wrist_roll` by the same angle without moving the gripper point.
     A large twist stops at the joint limit, the roll holds when the hand is lost, `T` turns it
@@ -239,6 +274,11 @@ Still needs you, in front of the camera:
   `mp.solutions.hands`.
 - **[Mink](https://github.com/kevinzakka/mink):** differential IK (FrameTask, PostureTask,
   ConfigurationLimit, VelocityLimit) with the DAQP solver.
+- **[Jordaine777/so101-leap-teleop](https://github.com/Jordaine777/so101-leap-teleop):** the
+  motion ideas behind the split IK: base/shoulder/elbow do the positioning while the wrist joints
+  are set directly (`--ik wrist` is that repo's version; the default `--ik jaws` targets the jaws instead), the reach shell around the shoulder, the sliding anchor at the edges,
+  and re-anchoring when the hand comes back. It uses a Leap Motion sensor and drives a real arm
+  through LeRobot. Neither is used here, and its code was rewritten rather than copied.
 - **[sruthihsr/SO101-Gesture-Teleoperation](https://github.com/sruthihsr/SO101-Gesture-Teleoperation):**
   I reviewed it for the overall idea (MediaPipe gestures driving an SO-101 in MuJoCo). It is built on
   ROS 2 and TCP under WSL, so none of its code is used; this project replaces that with one native

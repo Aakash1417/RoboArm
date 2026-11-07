@@ -71,13 +71,17 @@ class Teleop:
     """Relative hand-to-end-effector mapping.
 
     target = neutral_target + gain * (hand - neutral_hand), where "neutral" is captured on the
-    first detection and whenever you calibrate, resume, or finish homing. The commanded target
-    then moves toward that goal no faster than max_target_speed, so the robot never jumps.
+    first detection and whenever you calibrate, resume, finish homing, or bring your hand back after
+    losing it. The commanded target then moves toward that goal no faster than max_target_speed,
+    so the robot never jumps. The target is the gripper tip or the wrist joint, depending on the IK.
     """
 
-    def __init__(self, map_cfg: MappingConfig, robot_cfg: RobotConfig, home_target, roll_limits=(-np.pi, np.pi)):
+    def __init__(self, map_cfg: MappingConfig, robot_cfg: RobotConfig, home_target, roll_limits=(-np.pi, np.pi),
+                 clamp=None):
         self.cfg = map_cfg
         self.rcfg = robot_cfg
+        self.clamp = clamp or self.clamp_workspace  # keeps a target point reachable
+        self._lost_frames = 0
         self.home_target = np.array(home_target, dtype=float)
         self.gripper = GripperHysteresis(map_cfg)
         self.target = self.home_target.copy()
@@ -136,7 +140,11 @@ class Teleop:
     def observe(self, obs: HandObservation | None):
         self.tracking = obs is not None
         if obs is None:
-            # Hold position. The filter restarts on re-acquire; the speed limit keeps that gradual.
+            # Hold position. After a short dropout the old neutral still applies; after a longer
+            # one the returning hand re-anchors, like lifting a mouse off the desk.
+            self._lost_frames += 1
+            if self._lost_frames >= self.cfg.reanchor_frames:
+                self._needs_calibration = True
             self._ema = None
             self._filtered = None
             self.hand_angle = float("nan")
@@ -145,6 +153,7 @@ class Teleop:
                 self.roll_goal = self.roll_target
             return
 
+        self._lost_frames = 0
         self.last_pinch = grip_ratio(obs, self.cfg)
         self.last_fingers = finger_scores(obs, self.cfg) if self.cfg.grip_mode == "majority" else obs.finger_ratios
         self.hand_angle = obs.angle
@@ -183,7 +192,10 @@ class Teleop:
             -s * self.cfg.gain_xy * d[0],  # hand to your left -> robot +Y (its left, screen left)
             -s * self.cfg.gain_z * d[1],   # hand up (image y decreases) -> robot up
         ])
-        self.goal = self.clamp_workspace(self._neutral_target + offset)
+        raw = self._neutral_target + offset
+        self.goal = self.clamp(raw)
+        if self.cfg.slide_anchor:
+            self._neutral_target += self.goal - raw
 
     # ---- every control tick --------------------------------------------------------------
     def step(self, dt):

@@ -21,7 +21,7 @@ import numpy as np
 
 from so101_teleop.config import JOINT_NAMES, Config
 from so101_teleop.mapping import HandObservation, Teleop
-from so101_teleop.robot import CartesianIK, SO101Sim
+from so101_teleop.robot import SO101Sim, make_ik
 
 OUT = Path(__file__).resolve().parent / "selftest_output"
 failures = []
@@ -36,12 +36,15 @@ def check(name, ok, detail=""):
 class Rig:
     """Same control loop as main.py, but driven by scripted observations at 30 Hz."""
 
-    def __init__(self):
+    def __init__(self, ik_mode="jaws"):
         self.cfg = Config()
+        self.cfg.robot.ik_mode = self.mode = ik_mode
         self.sim = SO101Sim(self.cfg.robot)
-        self.ik = CartesianIK(self.cfg.robot)
+        self.ik = make_ik(self.cfg.robot)
         lo, hi = self.ik.joint_limits
-        self.teleop = Teleop(self.cfg.mapping, self.cfg.robot, self.ik.home_target, roll_limits=(lo[4], hi[4]))
+        self.teleop = Teleop(self.cfg.mapping, self.cfg.robot, self.ik.home_target, roll_limits=(lo[4], hi[4]),
+                             clamp=getattr(self.ik, "clamp", None))
+        self.max_tilt_error = 0.0
         self.grip = self.cfg.robot.gripper_open
         self.dt = 0.01
         self.max_target_speed = 0.0
@@ -67,7 +70,15 @@ class Rig:
             q = self.sim.joint_q
             self.max_joint_speed = max(self.max_joint_speed, np.abs(self.sim.data.qvel[self.sim.qpos_adr[:5]]).max())
             self.limit_violation = max(self.limit_violation, np.max(q - hi), np.max(lo - q))
-        return self.sim.ee_pos
+        q = self.sim.joint_q
+        if self.mode != "tip" and self.ik.lo[3] + 0.02 < q[3] < self.ik.hi[3] - 0.02:
+            self.max_tilt_error = max(self.max_tilt_error, abs(q[1:4].sum() - self.ik.tilt))
+        return self.pos
+
+    @property
+    def pos(self):
+        """The point the hand steers: the wrist joint in wrist mode, otherwise the jaws."""
+        return self.sim.control_pos(self.mode)
 
 
 def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None, angle=0.0, curls=(1.8,) * 4):
@@ -84,36 +95,44 @@ def test_model():
     check("model loads with 6 actuators", sim.model.nu == 6)
 
 
-def test_ik_grid():
-    cfg = Config()
-    ik = CartesianIK(cfg.robot)
-    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target)
+def test_ik_grid(ik_mode):
+    rig = Rig(ik_mode)
+    ik, clamp = rig.ik, rig.teleop.clamp
     lo, hi = ik.joint_limits
     errs = []
-    for x in np.linspace(0.14, 0.34, 5):
-        for y in np.linspace(-0.2, 0.2, 5):
-            for z in np.linspace(0.03, 0.25, 4):
-                tgt = teleop.clamp_workspace(np.array([x, y, z]))
+    xs, ys, zs = ((0.06, 0.34, 6), (-0.26, 0.26, 5), (0.03, 0.36, 5)) if ik_mode != "tip" else \
+        ((0.14, 0.34, 5), (-0.2, 0.2, 5), (0.03, 0.25, 4))
+    for x in np.linspace(*xs):
+        for y in np.linspace(*ys):
+            for z in np.linspace(*zs):
+                tgt = clamp(np.array([x, y, z]))
                 ik.reset()
                 for _ in range(300):
                     q = ik.solve(tgt, 0.01)
-                errs.append(np.linalg.norm(ik.ee_position() - tgt))
+                errs.append(np.linalg.norm(ik.position() - tgt))
                 assert np.all(q >= lo - 1e-6) and np.all(q <= hi + 1e-6)
     errs = np.array(errs)
-    check("IK reaches workspace targets", np.percentile(errs, 95) < 0.005,
+    check(f"[{ik_mode} IK] reaches workspace targets", np.percentile(errs, 95) < 0.005,
           f"(median {np.median(errs) * 1000:.1f} mm, 95th pct {np.percentile(errs, 95) * 1000:.1f} mm, "
           f"max {errs.max() * 1000:.1f} mm over {len(errs)} targets)")
 
 
-def test_pipeline():
-    rig = Rig()
+def test_pipeline(ik_mode):
+    rig = Rig(ik_mode)
     tp = rig.teleop
+    def check(name, ok, detail=""):
+        globals()["check"](f"[{ik_mode} IK] {name}", ok, detail)
+
     home = rig.run(1.5, hand())
     check("calibration does not move the robot", np.linalg.norm(home - rig.ik.home_target) < 0.01,
           f"(drift {np.linalg.norm(home - rig.ik.home_target) * 1000:.1f} mm)")
 
     p = rig.run(2.0, hand(x=0.35))
     check("hand left -> gripper moves left (+Y)", p[1] - home[1] > 0.05, f"(dy {p[1] - home[1]:+.3f} m)")
+    if ik_mode != "wrist":
+        off = p - home - np.array([0, 0.15 * rig.cfg.mapping.gain_xy, 0])
+        check("hand left 0.15 -> the jaws move straight left the same amount (1:1, no swing)",
+              np.linalg.norm(off) < 0.01, f"(off by {np.round(off * 1000, 1)} mm, the dead zone is 2.2)")
     p = rig.run(3.0, hand(x=0.65))
     check("hand right -> gripper moves right (-Y)", p[1] - home[1] < -0.05, f"(dy {p[1] - home[1]:+.3f} m)")
     rig.run(2.0, hand())
@@ -163,22 +182,32 @@ def test_pipeline():
     tp.cfg.grip_mode = "majority"
 
     rig.run(0.5, hand(x=0.4, y=0.45))
-    before = rig.sim.ee_pos
+    before = rig.pos
     rig.run(3.0, lambda t: None)
-    after = rig.sim.ee_pos
+    after = rig.pos
     check("hand lost -> robot holds position", np.linalg.norm(after - before) < 0.01,
           f"(moved {np.linalg.norm(after - before) * 1000:.1f} mm in 3 s)")
 
-    rig.max_target_speed = 0.0
-    rig.run(3.0, hand(x=0.95, y=0.1))
-    check("re-acquire far away -> bounded target speed",
-          rig.max_target_speed <= rig.cfg.robot.max_target_speed + 1e-6,
-          f"(max {rig.max_target_speed:.2f} m/s, limit {rig.cfg.robot.max_target_speed} m/s)")
+    p = rig.run(2.0, hand(x=0.9, y=0.1))
+    check("hand comes back somewhere else -> arm stays put (re-anchored, like lifting a mouse)",
+          np.linalg.norm(p - after) < 0.01, f"(moved {np.linalg.norm(p - after) * 1000:.1f} mm)")
+    rig.run(1.0, lambda t: None)
+    p0 = rig.run(1.0, hand(x=0.5, y=0.5))
+    blink = iter([None] * 3 + [hand(x=0.4, y=0.5)] * 1000)  # 0.1 s dropout, hand reappears 0.1 to the left
+    p1 = rig.run(2.0, lambda t: (o := next(blink)) and o(t))
+    expected = 0.1 * rig.cfg.mapping.gain_xy
+    check("a short dropout (3 frames) keeps the anchor, so the move still counts",
+          abs((p1[1] - p0[1]) - expected) < 0.01, f"(dy {p1[1] - p0[1]:+.3f} m, expected {expected:+.3f})")
 
     rig.run(3.0, hand(x=-2.0, y=-2.0))
     t = tp.target
-    inside = np.all(t >= rig.cfg.robot.workspace_min - 1e-9) and np.all(t <= rig.cfg.robot.workspace_max + 1e-9)
-    check("extreme hand position stays inside the workspace", inside, f"(target {np.round(t, 3)})")
+    check("extreme hand position stays inside the workspace", np.allclose(tp.clamp(t), t, atol=1e-6),
+          f"(target {np.round(t, 3)})")
+    p = rig.run(1.5, hand(x=-1.8, y=-2.0))
+    check("from the workspace edge, moving back responds immediately (sliding anchor)", t[1] - p[1] > 0.05,
+          f"(y {t[1]:+.3f} -> {p[1]:+.3f} m)")
+    rig.run(1.0, lambda t: None)
+    rig.run(1.0, hand())
 
     tp.toggle_pause()
     before = rig.sim.ee_pos
@@ -196,7 +225,7 @@ def test_pipeline():
           f"(error {np.linalg.norm(p - rig.ik.home_target) * 1000:.1f} mm)")
 
     rig.run(1.0, hand(x=0.2, y=0.8))
-    roll0, pos0 = rig.sim.joint_q[4], rig.sim.ee_pos
+    roll0, pos0 = rig.sim.joint_q[4], rig.pos
     p = rig.run(2.0, hand(x=0.2, y=0.8, angle=0.5))
     roll1 = rig.sim.joint_q[4]
     check("hand twist clockwise -> wrist_roll turns 0.5 rad (clockwise as seen from behind)",
@@ -224,13 +253,19 @@ def test_pipeline():
 
     tp.toggle_depth()
     rig.run(1.0, hand(size=0.12))
-    x0 = rig.sim.ee_pos[0]
+    x0 = rig.pos[0]
     p = rig.run(2.0, hand(size=0.18))
     check("depth estimate: bigger hand -> forward (+X)", p[0] - x0 > 0.03, f"(dx {p[0] - x0:+.3f} m)")
 
     check("joints never exceed model limits", rig.limit_violation < 0.02,
           f"(worst overshoot {rig.limit_violation:.4f} rad)")
     check("joint speeds stay moderate", rig.max_joint_speed < 6.0, f"(max {rig.max_joint_speed:.2f} rad/s)")
+    check("target point never moves faster than the speed cap",
+          rig.max_target_speed <= rig.cfg.robot.max_target_speed + 1e-6,
+          f"(max {rig.max_target_speed:.2f} m/s, limit {rig.cfg.robot.max_target_speed} m/s)")
+    if ik_mode != "tip":
+        check("gripper keeps its home tilt (except where wrist_flex is at its limit)", rig.max_tilt_error < 0.05,
+              f"(worst {np.degrees(rig.max_tilt_error):.1f} deg)")
 
 
 def test_snapshots():
@@ -320,8 +355,9 @@ if __name__ == "__main__":
     ap.add_argument("--camera", action="store_true", help="also test webcam 0")
     args = ap.parse_args()
     test_model()
-    test_ik_grid()
-    test_pipeline()
+    for mode in ("jaws", "wrist", "tip"):
+        test_ik_grid(mode)
+        test_pipeline(mode)
     test_snapshots()
     test_mediapipe()
     if args.camera:

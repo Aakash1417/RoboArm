@@ -45,6 +45,21 @@ class RobotConfig:
     wrist_roll_sign: float = -1.0
     max_roll_speed: float = 3.0  # rad/s
 
+    # How the hand's movement becomes joint angles (--ik):
+    #   "jaws"  (default): the point between the jaws follows your hand 1:1, the gripper keeps its
+    #           home tilt, and wrist_roll follows your twist.
+    #   "wrist": same, but the wrist joint follows your hand (as in so101-leap-teleop); the jaws hang
+    #           12.5 cm below it, so near the base they swing further than your hand moves.
+    #   "tip":  all 5 joints move the jaws and the tilt is free (the original behaviour).
+    ik_mode: str = "jaws"
+    # Limits for "jaws"/"wrist", applied to the wrist joint position, on top of a reach shell around
+    # the shoulder computed from the model. wrist_floor is the lowest the gripper TIP may go.
+    wrist_workspace_min: np.ndarray = field(default_factory=lambda: np.array([0.08, -0.26, 0.0]))
+    wrist_workspace_max: np.ndarray = field(default_factory=lambda: np.array([0.32, 0.26, 0.36]))
+    wrist_floor: float = 0.02
+    reach_max: float = 0.95  # fraction of upper arm + forearm length (just short of full stretch)
+    reach_min: float = 0.35  # so the arm doesn't fold into itself
+
     max_target_speed: float = 0.35  # m/s, caps how fast the target point can move
     max_joint_speed: float = 3.0    # rad/s, IK velocity limit per joint
     joint_limit_margin: float = 0.05  # rad kept away from each joint limit
@@ -78,6 +93,12 @@ class MappingConfig:
     smoothing: float = 0.35   # EMA factor per frame (0..1). Lower = smoother but laggier.
     dead_zone: float = 0.004  # normalized image units of hand jitter that are ignored
     depth_dead_zone: float = 0.03
+    # Clutch behaviour: after the hand has been gone this many camera frames (~0.25 s), its new
+    # position maps to wherever the robot is, so the arm never moves toward a re-appearing hand.
+    reanchor_frames: int = 8
+    # When the target hits the workspace edge, slide the neutral point along with it, so moving
+    # your hand back responds immediately instead of first having to return to where it crossed.
+    slide_anchor: bool = True
 
     # Gripper gesture, measured on MediaPipe's 3D hand landmarks.
     #   "majority": each of index/middle/ring/pinky counts as closed if EITHER

@@ -26,7 +26,7 @@ import numpy as np
 
 from so101_teleop.config import Config
 from so101_teleop.mapping import HandObservation, Teleop
-from so101_teleop.robot import CartesianIK, SO101Sim
+from so101_teleop.robot import SO101Sim, make_ik
 
 WINDOW = "Hand Tracking (keys work when this window is focused)"
 CONTROL_HZ = 100.0
@@ -149,7 +149,8 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
          (255, 255, 0) if mcfg.depth_enabled else (180, 180, 180)),
         (f"Wrist roll: {'ON' if mcfg.wrist_enabled else 'OFF'}   hand twist {math.degrees(teleop.hand_angle):+4.0f} deg"
          f"   robot {math.degrees(teleop.roll_target):+4.0f} deg", (255, 255, 255) if mcfg.wrist_enabled else (180, 180, 180)),
-        ("Target x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in teleop.target), (255, 255, 255)),
+        (f"{'Wrist' if teleop.rcfg.ik_mode == 'wrist' else 'Jaw'} target x/y/z [m]: "
+         + " ".join(f"{v:+.3f}" for v in teleop.target), (255, 255, 255)),
         ("Gripper   x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in sim.ee_pos), (200, 200, 200)),
     ]
     h, w = img.shape[:2]
@@ -194,6 +195,10 @@ def parse_args():
                    help="close the gripper when most fingertips touch the thumb, or on thumb-index pinch only")
     p.add_argument("--grip-fingers", type=int, default=None,
                    help="majority mode: how many of the 4 fingertips must touch the thumb (default 3)")
+    p.add_argument("--ik", choices=["jaws", "wrist", "tip"], default="jaws",
+                   help="jaws: your hand moves the jaws and the gripper keeps its tilt (default); "
+                        "wrist: your hand moves the wrist joint instead; "
+                        "tip: all 5 joints move the jaws and the tilt is free (the original behaviour)")
     p.add_argument("--duration", type=float, default=0, help="auto-quit after N seconds (0 = never)")
     return p.parse_args()
 
@@ -215,10 +220,12 @@ def main():
     if args.speed is not None:
         cfg.robot.max_target_speed = args.speed
 
+    cfg.robot.ik_mode = args.ik
     sim = SO101Sim(cfg.robot)
-    ik = CartesianIK(cfg.robot)
+    ik = make_ik(cfg.robot)
     lo, hi = ik.joint_limits
-    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target, roll_limits=(lo[4], hi[4]))
+    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target, roll_limits=(lo[4], hi[4]),
+                    clamp=getattr(ik, "clamp", None))
     teleop.sensitivity = args.sensitivity
     source = WebcamSource(cfg.hand) if args.input == "webcam" else VirtualHandSource(args.input)
 
