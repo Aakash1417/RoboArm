@@ -75,6 +75,7 @@ class VirtualHandSource:
         self._next = time.perf_counter()
         self._t0 = time.perf_counter()
         self.x, self.y, self.size, self.pinched, self.visible = 0.5, 0.5, 0.12, False, True
+        self.angle = 0.0
         self.draw_hand = None
 
     def poll(self):
@@ -87,6 +88,7 @@ class VirtualHandSource:
             self.x = 0.5 + 0.20 * math.sin(2 * math.pi * t / 6.0)
             self.y = 0.5 + 0.15 * math.sin(2 * math.pi * t / 4.0)
             self.pinched = (t % 6.0) > 3.0
+            self.angle = 0.7 * math.sin(2 * math.pi * t / 8.0)
             self.visible = (t % 15.0) < 13.0  # hand "disappears" for 2 s every 15 s
         frame = np.full((360, 640, 3), 40, np.uint8)
         cv2.putText(frame, f"{self.mode.upper()} INPUT (no webcam)", (10, 340), cv2.FONT_HERSHEY_SIMPLEX,
@@ -97,8 +99,10 @@ class VirtualHandSource:
         r = int(self.size * 640 / 2)
         cv2.circle(frame, c, r, (0, 0, 255) if self.pinched else (0, 255, 0), 2, cv2.LINE_AA)
         cv2.drawMarker(frame, c, (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
+        tip = (int(c[0] + r * math.sin(self.angle)), int(c[1] - r * math.cos(self.angle)))
+        cv2.line(frame, c, tip, (255, 255, 255), 2, cv2.LINE_AA)  # "fingers" direction
         r = 0.1 if self.pinched else 0.8
-        obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r))
+        obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r), self.angle)
         return frame, obs, None
 
     def handle_key(self, key):
@@ -117,6 +121,10 @@ class VirtualHandSource:
             self.pinched = not self.pinched
         elif key == ord("h"):
             self.visible = not self.visible
+        elif key == ord("["):
+            self.angle -= math.radians(10)
+        elif key == ord("]"):
+            self.angle += math.radians(10)
         else:
             return False
         return True
@@ -130,13 +138,16 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
         (f"Status: {teleop.status}", (0, 255, 0) if teleop.status == "TRACKING" else (0, 200, 255)),
         (f"Gripper: {'CLOSED' if teleop.gripper.closed else 'OPEN'}",
          (0, 0, 255) if teleop.gripper.closed else (0, 255, 0)),
-        (f"Grip ratio ({'all fingers' if mcfg.grip_mode == 'all' else 'index pinch'}): {teleop.last_pinch:.2f}"
+        (f"Grip ratio ({f'{mcfg.grip_min_fingers} of 4 fingers' if mcfg.grip_mode == 'majority' else 'index pinch'}):"
+         f" {teleop.last_pinch:.2f}"
          f"  (close<{mcfg.grip_thresholds[0]:.2f} open>{mcfg.grip_thresholds[1]:.2f})", (255, 255, 255)),
         ("Thumb to  " + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"),
                                                                 teleop.last_fingers)), (200, 200, 200)),
         (f"Camera FPS: {cam_fps:4.1f}   Sensitivity: x{teleop.sensitivity:.2f}", (255, 255, 255)),
         (f"Depth (forward/back): {'ON - ESTIMATE from hand size' if mcfg.depth_enabled else 'OFF'}",
          (255, 255, 0) if mcfg.depth_enabled else (180, 180, 180)),
+        (f"Wrist roll: {'ON' if mcfg.wrist_enabled else 'OFF'}   hand twist {math.degrees(teleop.hand_angle):+4.0f} deg"
+         f"   robot {math.degrees(teleop.roll_target):+4.0f} deg", (255, 255, 255) if mcfg.wrist_enabled else (180, 180, 180)),
         ("Target x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in teleop.target), (255, 255, 255)),
         ("Gripper   x/y/z [m]: " + " ".join(f"{v:+.3f}" for v in sim.ee_pos), (200, 200, 200)),
     ]
@@ -150,9 +161,9 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
     for i, (text, color) in enumerate(lines):
         cv2.putText(img, text, (pad, line_h * (i + 1) - pad // 2), font, scale, color, 1, cv2.LINE_AA)
 
-    help_text = "Q quit  SPACE pause  C calibrate  R home  F depth  +/- sensitivity"
+    help_text = "Q quit  SPACE pause  C calibrate  R home  F depth  T wrist  +/- sensitivity"
     if mode == "keyboard":
-        help_text += "  | WASD move  E/X fwd/back  G grip  H hide hand"
+        help_text += "  | WASD move  E/X fwd/back  [ ] twist  G grip  H hide"
     help_scale = 0.85 * scale
     shade(img, 0, h - line_h - pad, w, h)
     cv2.putText(img, help_text, (pad, h - pad - line_h // 4), font, help_scale, (255, 255, 255), 1, cv2.LINE_AA)
@@ -177,8 +188,11 @@ def parse_args():
     p.add_argument("--smoothing", type=float, default=None, help="EMA factor 0..1 (lower = smoother)")
     p.add_argument("--speed", type=float, default=None, help="max gripper target speed in m/s")
     p.add_argument("--depth", action="store_true", help="enable forward/back from hand size (estimate)")
-    p.add_argument("--grip", choices=["all", "index"], default="all",
-                   help="close the gripper when all fingertips touch the thumb, or on thumb-index pinch only")
+    p.add_argument("--no-wrist", action="store_true", help="start with wrist roll tracking off (T toggles)")
+    p.add_argument("--grip", choices=["majority", "index"], default="majority",
+                   help="close the gripper when most fingertips touch the thumb, or on thumb-index pinch only")
+    p.add_argument("--grip-fingers", type=int, default=None,
+                   help="majority mode: how many of the 4 fingertips must touch the thumb (default 3)")
     p.add_argument("--duration", type=float, default=0, help="auto-quit after N seconds (0 = never)")
     return p.parse_args()
 
@@ -192,6 +206,9 @@ def main():
     cfg.hand.process_width = args.process_width
     cfg.mapping.depth_enabled = args.depth
     cfg.mapping.grip_mode = args.grip
+    if args.grip_fingers is not None:
+        cfg.mapping.grip_min_fingers = int(np.clip(args.grip_fingers, 1, 4))
+    cfg.mapping.wrist_enabled = not args.no_wrist
     if args.smoothing is not None:
         cfg.mapping.smoothing = float(np.clip(args.smoothing, 0.01, 1.0))
     if args.speed is not None:
@@ -199,7 +216,8 @@ def main():
 
     sim = SO101Sim(cfg.robot)
     ik = CartesianIK(cfg.robot)
-    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target)
+    lo, hi = ik.joint_limits
+    teleop = Teleop(cfg.mapping, cfg.robot, ik.home_target, roll_limits=(lo[4], hi[4]))
     teleop.sensitivity = args.sensitivity
     source = WebcamSource(cfg.hand) if args.input == "webcam" else VirtualHandSource(args.input)
 
@@ -212,7 +230,7 @@ def main():
     cam_fps, last_frame_t = 0.0, None
     n_frames = n_hand = n_ticks = 0
     print("Controls (focus the hand-tracking window): Q quit, SPACE pause, C calibrate, R home, "
-          "F depth, +/- sensitivity. Drag in the MuJoCo window to rotate the view.")
+          "F depth, T wrist roll, +/- sensitivity. Drag in the MuJoCo window to rotate the view.")
 
     with mujoco.viewer.launch_passive(sim.model, sim.data, show_left_ui=False, show_right_ui=False) as viewer:
         with viewer.lock():
@@ -241,13 +259,14 @@ def main():
                 if px is not None:
                     close_below = cfg.mapping.grip_thresholds[0]
                     fingers = [r < close_below for r in obs.finger_ratios]
-                    if cfg.mapping.grip_mode != "all":
+                    if cfg.mapping.grip_mode != "majority":
                         fingers = fingers[:1]
                     source.draw_hand(view, px * zoom, fingers, teleop.gripper.closed)
                 draw_hud(view, teleop, sim, cfg.mapping, cam_fps, args.input)
                 cv2.imshow(WINDOW, view)
 
             target = teleop.step(dt)
+            ik.set_wrist_roll(teleop.roll_target)
             arm_q = ik.solve(target, dt)
             want = cfg.robot.gripper_closed if teleop.gripper.closed else cfg.robot.gripper_open
             gripper_cmd += np.clip(want - gripper_cmd, -cfg.robot.gripper_speed * dt, cfg.robot.gripper_speed * dt)
@@ -269,6 +288,8 @@ def main():
                     teleop.reset_home()
                 elif key in (ord("f"), ord("F")):
                     teleop.toggle_depth()
+                elif key in (ord("t"), ord("T")):
+                    teleop.toggle_wrist()
                 elif key in (ord("+"), ord("=")):
                     teleop.change_sensitivity(1.25)
                 elif key in (ord("-"), ord("_")):

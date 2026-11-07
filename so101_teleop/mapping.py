@@ -14,12 +14,22 @@ class HandObservation:
     size: float         # apparent palm size (fraction of image width); grows as the hand nears the camera
     pinch_ratio: float  # thumb-index distance / palm length; small = pinched
     finger_ratios: tuple = ()  # thumb to index, middle, ring, pinky tips / palm length
+    angle: float = 0.0  # hand twist in radians: 0 = fingers up, positive = clockwise as you see it
 
 
-def grip_ratio(obs: HandObservation, mode: str) -> float:
-    """The single number the gripper thresholds are applied to."""
-    if mode == "all" and obs.finger_ratios:
-        return max(obs.finger_ratios)
+def wrap_angle(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def grip_ratio(obs: HandObservation, cfg: MappingConfig) -> float:
+    """The single number the gripper thresholds are applied to.
+
+    In majority mode this is the k-th closest fingertip (k = grip_min_fingers): it is below the
+    close threshold exactly when at least k fingertips are at the thumb.
+    """
+    if cfg.grip_mode == "majority" and obs.finger_ratios:
+        k = int(np.clip(cfg.grip_min_fingers, 1, len(obs.finger_ratios)))
+        return sorted(obs.finger_ratios)[k - 1]
     return obs.pinch_ratio
 
 
@@ -57,13 +67,20 @@ class Teleop:
     then moves toward that goal no faster than max_target_speed, so the robot never jumps.
     """
 
-    def __init__(self, map_cfg: MappingConfig, robot_cfg: RobotConfig, home_target):
+    def __init__(self, map_cfg: MappingConfig, robot_cfg: RobotConfig, home_target, roll_limits=(-np.pi, np.pi)):
         self.cfg = map_cfg
         self.rcfg = robot_cfg
         self.home_target = np.array(home_target, dtype=float)
         self.gripper = GripperHysteresis(map_cfg)
         self.target = self.home_target.copy()
         self.goal = self.home_target.copy()
+        # Wrist roll is a joint angle (rad), commanded directly rather than through Cartesian IK.
+        margin = robot_cfg.joint_limit_margin
+        self.roll_limits = (roll_limits[0] + margin, roll_limits[1] - margin)
+        self.roll_home = float(robot_cfg.home_q[4])
+        self.roll_target = self.roll_home
+        self.roll_goal = self.roll_home
+        self.hand_angle = float("nan")
         self.paused = False
         self.homing = False
         self.tracking = False
@@ -75,6 +92,7 @@ class Teleop:
         self._filtered = None
         self._neutral_hand = None
         self._neutral_target = self.home_target.copy()
+        self._neutral_roll = self.roll_home
 
     # ---- user commands -------------------------------------------------------------------
     def calibrate(self):
@@ -86,13 +104,20 @@ class Teleop:
         if not self.paused:
             self.calibrate()  # resume like a clutch: wherever your hand is now maps to "here"
         self.goal = self.target.copy()
+        self.roll_goal = self.roll_target
 
     def reset_home(self):
         self.homing = True
         self.goal = self.home_target.copy()
+        self.roll_goal = self.roll_home
 
     def toggle_depth(self):
         self.cfg.depth_enabled = not self.cfg.depth_enabled
+        self.calibrate()
+
+    def toggle_wrist(self):
+        self.cfg.wrist_enabled = not self.cfg.wrist_enabled
+        self.roll_goal = self.roll_target
         self.calibrate()
 
     def change_sensitivity(self, factor):
@@ -106,20 +131,25 @@ class Teleop:
             # Hold position. The filter restarts on re-acquire; the speed limit keeps that gradual.
             self._ema = None
             self._filtered = None
+            self.hand_angle = float("nan")
             if not self.homing:
                 self.goal = self.target.copy()
+                self.roll_goal = self.roll_target
             return
 
-        self.last_pinch = grip_ratio(obs, self.cfg.grip_mode)
+        self.last_pinch = grip_ratio(obs, self.cfg)
         self.last_fingers = obs.finger_ratios
-        meas = np.array([obs.x, obs.y, np.log(max(obs.size, 1e-4))])
+        self.hand_angle = obs.angle
+        meas = np.array([obs.x, obs.y, np.log(max(obs.size, 1e-4)), obs.angle])
         if self._ema is None:
             self._ema = meas.copy()
             self._filtered = meas.copy()
         else:
+            meas[3] = self._ema[3] + wrap_angle(meas[3] - self._ema[3])  # no jump across +/-180 deg
             self._ema += self.cfg.smoothing * (meas - self._ema)
             # Dead zone as backlash: output only follows once the hand moves beyond the band.
-            band = np.array([self.cfg.dead_zone, self.cfg.dead_zone, self.cfg.depth_dead_zone])
+            band = np.array([self.cfg.dead_zone, self.cfg.dead_zone, self.cfg.depth_dead_zone,
+                             self.cfg.roll_dead_zone])
             diff = self._ema - self._filtered
             self._filtered += np.sign(diff) * np.maximum(np.abs(diff) - band, 0.0)
 
@@ -132,9 +162,13 @@ class Teleop:
         if self._needs_calibration or self._neutral_hand is None:
             self._neutral_hand = self._filtered.copy()
             self._neutral_target = self.target.copy()
+            self._neutral_roll = self.roll_target
             self._needs_calibration = False
 
         d = self._filtered - self._neutral_hand
+        if self.cfg.wrist_enabled:
+            roll = self._neutral_roll + self.rcfg.wrist_roll_sign * self.cfg.gain_roll * wrap_angle(d[3])
+            self.roll_goal = float(np.clip(roll, *self.roll_limits))
         s = self.sensitivity
         offset = np.array([
             s * self.cfg.gain_depth * d[2] if self.cfg.depth_enabled else 0.0,  # bigger hand -> forward
@@ -152,7 +186,10 @@ class Teleop:
         if dist > max_step:
             delta *= max_step / dist
         self.target = self.target + delta
-        if self.homing and np.linalg.norm(self.goal - self.target) < 1e-3:
+        max_roll = self.rcfg.max_roll_speed * dt
+        self.roll_target += float(np.clip(self.roll_goal - self.roll_target, -max_roll, max_roll))
+        if (self.homing and np.linalg.norm(self.goal - self.target) < 1e-3
+                and abs(self.roll_goal - self.roll_target) < 1e-3):
             self.homing = False
             self.calibrate()
         return self.target

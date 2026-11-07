@@ -40,7 +40,8 @@ class Rig:
         self.cfg = Config()
         self.sim = SO101Sim(self.cfg.robot)
         self.ik = CartesianIK(self.cfg.robot)
-        self.teleop = Teleop(self.cfg.mapping, self.cfg.robot, self.ik.home_target)
+        lo, hi = self.ik.joint_limits
+        self.teleop = Teleop(self.cfg.mapping, self.cfg.robot, self.ik.home_target, roll_limits=(lo[4], hi[4]))
         self.grip = self.cfg.robot.gripper_open
         self.dt = 0.01
         self.max_target_speed = 0.0
@@ -56,6 +57,7 @@ class Rig:
             prev = self.teleop.target.copy()
             target = self.teleop.step(self.dt)
             self.max_target_speed = max(self.max_target_speed, np.linalg.norm(target - prev) / self.dt)
+            self.ik.set_wrist_roll(self.teleop.roll_target)
             arm_q = self.ik.solve(target, self.dt)
             want = self.cfg.robot.gripper_closed if self.teleop.gripper.closed else self.cfg.robot.gripper_open
             s = self.cfg.robot.gripper_speed * self.dt
@@ -68,9 +70,9 @@ class Rig:
         return self.sim.ee_pos
 
 
-def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None):
+def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None, angle=0.0):
     fingers = fingers or (pinch,) * 4
-    return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers))
+    return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers), angle)
 
 
 def test_model():
@@ -125,17 +127,17 @@ def test_pipeline():
     g_closed = rig.sim.joint_q[5]
     rig.run(1.0, hand(pinch=0.8))
     g_open = rig.sim.joint_q[5]
-    check("all fingers to thumb closes, opening releases gripper",
+    check("fingertips to thumb closes, opening releases gripper",
           tp.gripper.closed is False and g_closed < 0.1 < 1.0 < g_open,
           f"(closed {g_closed:+.2f} rad, open {g_open:+.2f} rad)")
 
-    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.1, 0.9)))
-    stayed_open = not tp.gripper.closed
-    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.1, 0.1)))
-    now_closed = tp.gripper.closed
-    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.9, 0.1)))
-    check("gripper needs every finger: 3 of 4 stays open, 4 of 4 closes, lifting one opens",
-          stayed_open and now_closed and not tp.gripper.closed)
+    rig.run(1.0, hand(fingers=(0.1, 0.1, 0.9, 0.9)))
+    two_open = not tp.gripper.closed
+    rig.run(1.0, hand(fingers=(0.1, 0.9, 0.1, 0.1)))
+    three_closed = tp.gripper.closed
+    rig.run(1.0, hand(fingers=(0.1, 0.9, 0.9, 0.1)))
+    check("majority grip: 2 of 4 fingertips stays open, any 3 of 4 closes, back to 2 opens",
+          two_open and three_closed and not tp.gripper.closed)
 
     flicker = iter([0.1, 0.8, 0.1, 0.8, 0.55, 0.55, 0.55] * 50)
     rig.run(1.0, lambda t: HandObservation(0.5, 0.5, 0.12, r := next(flicker), (r,) * 4))
@@ -145,7 +147,7 @@ def test_pipeline():
     rig.run(1.0, hand(fingers=(0.1, 0.9, 0.9, 0.9)))
     check("--grip index mode: thumb-index pinch alone closes", tp.gripper.closed)
     rig.run(1.0, hand())
-    tp.cfg.grip_mode = "all"
+    tp.cfg.grip_mode = "majority"
 
     rig.run(0.5, hand(x=0.4, y=0.45))
     before = rig.sim.ee_pos
@@ -179,6 +181,33 @@ def test_pipeline():
     p = rig.run(4.0, hand(x=0.2, y=0.8))
     check("R returns to home", np.linalg.norm(p - rig.ik.home_target) < 0.01 and not tp.homing,
           f"(error {np.linalg.norm(p - rig.ik.home_target) * 1000:.1f} mm)")
+
+    rig.run(1.0, hand(x=0.2, y=0.8))
+    roll0, pos0 = rig.sim.joint_q[4], rig.sim.ee_pos
+    p = rig.run(2.0, hand(x=0.2, y=0.8, angle=0.5))
+    roll1 = rig.sim.joint_q[4]
+    check("hand twist clockwise -> wrist_roll turns 0.5 rad (clockwise as seen from behind)",
+          abs((roll1 - roll0) - rig.cfg.robot.wrist_roll_sign * 0.5) < 0.03,
+          f"(wrist_roll {roll0:+.2f} -> {roll1:+.2f} rad)")
+    check("twisting does not move the gripper position", np.linalg.norm(p - pos0) < 0.01,
+          f"(moved {np.linalg.norm(p - pos0) * 1000:.1f} mm)")
+    rig.run(3.0, hand(x=0.2, y=0.8, angle=-2.0))
+    hi_roll = rig.ik.joint_limits[1][4]
+    check("large twist stops at the wrist_roll limit", rig.sim.joint_q[4] <= hi_roll + 0.01,
+          f"(wrist_roll {rig.sim.joint_q[4]:+.2f}, limit {hi_roll:+.2f} rad)")
+    held = rig.sim.joint_q[4]
+    rig.run(2.0, lambda t: None)
+    check("hand lost -> wrist roll holds", abs(rig.sim.joint_q[4] - held) < 0.02)
+    tp.toggle_wrist()
+    rig.run(1.0, hand(x=0.2, y=0.8))
+    held = rig.sim.joint_q[4]
+    rig.run(1.5, hand(x=0.2, y=0.8, angle=0.8))
+    check("T (wrist off) ignores hand twist", abs(rig.sim.joint_q[4] - held) < 0.02)
+    tp.toggle_wrist()
+    tp.reset_home()
+    rig.run(4.0, hand(x=0.2, y=0.8, angle=0.8))
+    check("R also returns the wrist roll home", abs(rig.sim.joint_q[4] - rig.cfg.robot.home_q[4]) < 0.03,
+          f"(wrist_roll {rig.sim.joint_q[4]:+.2f} rad)")
 
     tp.toggle_depth()
     rig.run(1.0, hand(size=0.12))

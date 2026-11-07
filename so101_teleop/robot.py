@@ -67,8 +67,9 @@ class CartesianIK:
         self.ee_task = mink.FrameTask(
             frame_name=EE_SITE, frame_type="site", position_cost=1.0, orientation_cost=0.0, lm_damping=1e-2
         )
-        # Per-DoF posture weights: pan, lift, elbow, wrist_flex, wrist_roll, gripper.
-        self.posture_task = mink.PostureTask(self.model, cost=np.array([1e-3, 1e-3, 1e-3, 2e-2, 5e-2, 1.0]))
+        # Per-DoF posture weights: pan, lift, elbow, wrist_flex, wrist_roll, gripper. wrist_roll is
+        # weighted higher because its posture target is the hand-twist command (set_wrist_roll).
+        self.posture_task = mink.PostureTask(self.model, cost=np.array([1e-3, 1e-3, 1e-3, 2e-2, 1.0, 1.0]))
         self.tasks = [self.ee_task, self.posture_task]
         self.limits = [
             mink.ConfigurationLimit(self.model, min_distance_from_limits=cfg.joint_limit_margin),
@@ -81,8 +82,13 @@ class CartesianIK:
         q = np.zeros(self.model.nq)
         q[self.arm_adr] = self.cfg.home_q
         self.configuration.update(q)
-        self.posture_task.set_target(q)
+        self.posture_q = q.copy()
+        self.posture_task.set_target(self.posture_q)
         self.home_target = self.ee_position()
+
+    def set_wrist_roll(self, roll):
+        self.posture_q[self.arm_adr[4]] = roll
+        self.posture_task.set_target(self.posture_q)
 
     def ee_position(self):
         return self.configuration.get_transform_frame_to_world(EE_SITE, "site").translation()

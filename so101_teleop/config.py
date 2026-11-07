@@ -40,6 +40,11 @@ class RobotConfig:
     max_reach: float = 0.33
     min_reach: float = 0.10
 
+    # In the home pose the wrist_roll axis points back toward the viewer, so a clockwise hand twist
+    # (as you see it) needs a negative joint change to look clockwise on screen.
+    wrist_roll_sign: float = -1.0
+    max_roll_speed: float = 3.0  # rad/s
+
     max_target_speed: float = 0.35  # m/s, caps how fast the target point can move
     max_joint_speed: float = 3.0    # rad/s, IK velocity limit per joint
     joint_limit_margin: float = 0.05  # rad kept away from each joint limit
@@ -65,6 +70,10 @@ class MappingConfig:
     # Forward/back from apparent hand size (estimate only): metres per +100% change in hand size.
     gain_depth: float = 0.20
     depth_enabled: bool = False
+    # Wrist roll follows hand twist (rotation in the image plane, like turning a doorknob).
+    wrist_enabled: bool = True
+    gain_roll: float = 1.0          # robot radians per hand radian
+    roll_dead_zone: float = 0.03    # rad (~2 degrees)
 
     smoothing: float = 0.35   # EMA factor per frame (0..1). Lower = smoother but laggier.
     dead_zone: float = 0.004  # normalized image units of hand jitter that are ignored
@@ -72,10 +81,11 @@ class MappingConfig:
 
     # Grip ratio = thumb-tip to fingertip distance divided by palm length (wrist to middle-finger base),
     # measured on MediaPipe's 3D hand landmarks.
-    #   "all":   uses the FARTHEST of index/middle/ring/pinky, so the gripper only closes when every
-    #            fingertip is brought to the thumb, and opens as soon as any finger moves away.
-    #   "index": thumb-index pinch only.
-    grip_mode: str = "all"
+    #   "majority": closes when at least grip_min_fingers of index/middle/ring/pinky touch the thumb,
+    #               and opens once fewer than that are still touching.
+    #   "index":    thumb-index pinch only.
+    grip_mode: str = "majority"
+    grip_min_fingers: int = 3  # out of 4 fingertips; 4 = all fingers, 2 = thumb plus any two
     all_close_below: float = 0.45
     all_open_above: float = 0.65
     pinch_close_below: float = 0.30
@@ -84,7 +94,7 @@ class MappingConfig:
 
     @property
     def grip_thresholds(self):
-        if self.grip_mode == "all":
+        if self.grip_mode == "majority":
             return self.all_close_below, self.all_open_above
         return self.pinch_close_below, self.pinch_open_above
 

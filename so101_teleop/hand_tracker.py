@@ -132,7 +132,15 @@ def observation_from_landmarks(norm, px, width, world=None):
         size=float((palm_length + palm_width) / width),
         pinch_ratio=ratios[0],
         finger_ratios=ratios,
+        angle=hand_angle(px),
     )
+
+
+def hand_angle(px):
+    """Twist of the wrist-to-middle-knuckle line in the mirrored image (y down).
+    0 = fingers pointing up, positive = rotated clockwise as you see it on screen."""
+    v = px[9] - px[0]
+    return float(np.arctan2(v[0], -v[1]))
 
 
 def draw_hand(img, px, finger_closed, gripper_closed):
