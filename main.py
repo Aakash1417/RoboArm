@@ -5,7 +5,9 @@
     python main.py --input keyboard   # no webcam: move a virtual hand with keys
     python main.py --input synthetic  # no webcam: scripted hand motion demo
 
-Simulation only. Nothing is ever sent to a physical robot.
+    python main.py --real             # the physical arm follows (after arm.py calibrate + mirror)
+
+Without --real nothing is sent to the physical robot.
 """
 
 import os
@@ -200,7 +202,48 @@ def parse_args():
                         "wrist: your hand moves the wrist joint instead; "
                         "tip: all 5 joints move the jaws and the tilt is free (the original behaviour)")
     p.add_argument("--duration", type=float, default=0, help="auto-quit after N seconds (0 = never)")
+    p.add_argument("--real", action="store_true",
+                   help="the physical arm follows the sim (calibrate and 'arm.py mirror' first)")
+    p.add_argument("--fake-arm", action="store_true", help="with --real: a simulated servo bus instead")
+    p.add_argument("--port", help="with --real: the arm's serial port, e.g. COM6")
+    p.add_argument("--real-speed", type=float, default=90.0, help="with --real: max joint speed in deg/s")
+    p.add_argument("--real-torque", type=float, default=50.0, help="with --real: torque limit in %%")
     return p.parse_args()
+
+
+def connect_arm(args):
+    from so101_real import calibration as calib
+    from so101_real import follower
+    from so101_real.bus import open_bus
+
+    bus = open_bus(args.port, args.fake_arm)
+    try:
+        cal = follower.load_checked(bus, calib.FAKE_CALIBRATION_FILE if args.fake_arm else calib.CALIBRATION_FILE)
+        map_file = follower.FAKE_SIM_MAP_FILE if args.fake_arm else follower.SIM_MAP_FILE
+        if not map_file.exists() and not args.fake_arm:
+            raise follower.BusError("No sim mapping yet. Run 'python arm.py mirror' first and save (S) once "
+                                    "every joint moves the same way as the real arm.")
+        sim_model = SO101Sim(Config().robot).model
+        mapping = follower.Mapping(cal, follower.model_ranges(sim_model, list(cal)),
+                                   follower.load_map(map_file, list(cal)))
+        arm = follower.RealArm(bus, cal, mapping, speed_deg=args.real_speed, torque=args.real_torque)
+        print(f"REAL ARM: torque comes on and the arm moves to the sim's home pose at up to "
+              f"{args.real_speed:g} deg/s (torque limit {args.real_torque:g} %), then follows your hand.\n"
+              "Clear the space around it. SPACE in the hand window pauses; closing the windows stops it.")
+        input("Ready? [Enter] ")
+        arm.start()
+    except BaseException:
+        bus.close()
+        raise
+    return arm
+
+
+def release_arm(arm):
+    ans = input("\nRelease the arm's torque? It goes limp, so support it first. "
+                "[y = release / Enter = keep holding] ")
+    if ans.strip().lower() == "y":
+        arm.relax()
+    arm.bus.close()
 
 
 def main():
@@ -221,6 +264,22 @@ def main():
         cfg.robot.max_target_speed = args.speed
 
     cfg.robot.ik_mode = args.ik
+    arm = None
+    if args.real:
+        from so101_real.bus import BusError
+
+        try:
+            arm = connect_arm(args)
+        except BusError as e:
+            sys.exit(f"Error: {e}")
+    try:
+        run(args, cfg, arm)
+    finally:
+        if arm is not None:
+            release_arm(arm)
+
+
+def run(args, cfg, arm):
     sim = SO101Sim(cfg.robot)
     ik = make_ik(cfg.robot)
     lo, hi = ik.joint_limits
@@ -279,6 +338,8 @@ def main():
             want = cfg.robot.gripper_closed if teleop.gripper.closed else cfg.robot.gripper_open
             gripper_cmd += np.clip(want - gripper_cmd, -cfg.robot.gripper_speed * dt, cfg.robot.gripper_speed * dt)
             sim.set_command(arm_q, gripper_cmd)
+            if arm is not None:
+                arm.send(np.append(arm_q, gripper_cmd))
             sim.set_target_marker(target)
             sim.step(dt)
             viewer.sync()

@@ -417,6 +417,34 @@ def test_arm_tools():
         refused = True
     check("arm: torque-on is refused when the stored limits are nonsense (min above max)", refused)
 
+    from so101_real import follower
+
+    names = list(cal)
+    ranges = {n: (-1.7, 1.7) for n in names}
+    ranges["gripper"] = (-0.17, 1.75)
+    maps = {n: follower.JointMap() for n in names}
+    maps["elbow_flex"] = follower.JointMap(sign=-1, trim_deg=10)
+    mapping = follower.Mapping(cal, ranges, maps)
+    round_trip = all(abs(mapping.to_rad(n, mapping.to_ticks(n, q)) - q) < 0.002
+                     for n in names for q in (0.3, -0.4))
+    c = cal["elbow_flex"]
+    check("arm: sim angle <-> servo ticks round-trips (incl. flipped + trimmed); far angles stop at the limits",
+          round_trip and mapping.to_ticks("elbow_flex", -9) == c.range_max
+          and mapping.to_ticks("elbow_flex", 9) == c.range_min)
+    for n, i in calib.JOINTS.items():
+        lo, hi = bus.stops[i]
+        bus.move_by_hand(i, (lo + hi) / 2)
+    arm = follower.RealArm(bus, cal, mapping, speed_deg=3000)
+    arm.start()
+    want = [0.2, -0.3, 0.4, 0.1, -0.5, 0.6]
+    for _ in range(30):
+        arm.send(want)
+        time.sleep(0.02)
+    got = arm.read()
+    arm.relax()
+    check("arm: the real arm follows sim joint angles", np.allclose(got, want, atol=0.01),
+          f"(got {np.round(got, 3)})")
+
     rec = calib.RangeRecorder([1])
     rec.update({1: 2000})
     rec.update({1: 2100})

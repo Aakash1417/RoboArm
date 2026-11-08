@@ -8,9 +8,10 @@
     python arm.py calibrate              # centre each joint and record its min/max (writes the servos)
     python arm.py show                   # current positions, limits, and whether they match the file
     python arm.py jog                    # move each joint by keyboard, inside the calibrated limits
+    python arm.py mirror                 # torque off: the sim copies the arm; fix joint directions
 
 Add --port COM5 if more than one serial port exists, and --fake to try any command with a
-simulated arm. The simulation (main.py) never talks to the arm; only this script does.
+simulated arm. After mirror, 'python main.py --real' makes the arm follow your hand.
 """
 
 import argparse
@@ -348,6 +349,70 @@ def cmd_jog(args, bus):
                     bus.torque_off(jj.id)
 
 
+def cmd_mirror(args, bus):
+    import mujoco
+    import mujoco.viewer
+
+    from so101_real import follower
+    from so101_teleop.config import JOINT_NAMES, Config
+    from so101_teleop.robot import SO101Sim
+
+    cal = follower.load_checked(bus, args.file)
+    sim = SO101Sim(Config().robot)
+    names = list(cal)
+    maps = follower.load_map(args.map, names)
+    mapping = follower.Mapping(cal, follower.model_ranges(sim.model, names), maps)
+    for c in cal.values():
+        bus.torque_off(c.id)
+    print("MIRROR: torque is off (support the arm). Move the real arm by hand; the sim copies it.\n"
+          "Each joint should turn the SAME WAY as the real one. If one turns the opposite way, select it\n"
+          "and press F. If one is turned by a constant angle (common for the wrist roll), trim it with [ ].\n"
+          "Keys work in this console window: 1-6 pick joint  F flip direction  [ ] trim -/+ 2 deg\n"
+          "0 clear trim  S save  Q quit")
+    sel, message = 0, ""
+    screen = Screen()
+    with mujoco.viewer.launch_passive(sim.model, sim.data, show_left_ui=False, show_right_ui=False) as viewer:
+        with viewer.lock():
+            viewer.cam.lookat[:] = [0.17, 0.0, 0.08]
+            viewer.cam.distance = 0.85
+            viewer.cam.azimuth = -20
+            viewer.cam.elevation = -30
+        while viewer.is_running():
+            key = read_key()
+            n = names[sel]
+            if key in tuple("123456"):
+                sel = min(int(key) - 1, len(names) - 1)
+            elif key in ("f", "F"):
+                maps[n].sign *= -1
+                message = f"{n} flipped (not saved yet)"
+            elif key in ("[", "]"):
+                maps[n].trim_deg += 2 if key == "]" else -2
+                message = f"{n} trim {maps[n].trim_deg:+g} deg (not saved yet)"
+            elif key == "0":
+                maps[n].trim_deg = 0.0
+            elif key in ("s", "S"):
+                follower.save_map(maps, args.map)
+                message = f"saved to {args.map}"
+            elif key in ("q", "Q"):
+                break
+            ticks = {m: bus.read(cal[m].id, "Present_Position") for m in names}
+            q = {m: mapping.to_rad(m, t) for m, t in ticks.items()}
+            sim.data.qpos[sim.qpos_adr] = [q[m] for m in JOINT_NAMES]
+            mujoco.mj_forward(sim.model, sim.data)
+            viewer.sync()
+            lines = [message]
+            for k, m in enumerate(names):
+                lines.append(f"{'>' if k == sel else ' '}{k + 1} {m:13} pos {ticks[m]:>4}  sim {math.degrees(q[m]):+6.1f} deg"
+                             f"  {'flipped' if maps[m].sign < 0 else 'normal '}  trim {maps[m].trim_deg:+5.1f}")
+            screen.draw(lines)
+            time.sleep(0.03)
+    saved = follower.load_map(args.map, names)
+    if saved != maps:
+        if input("\nSave the changes? [y/N] ").strip().lower() == "y":
+            follower.save_map(maps, args.map)
+            print(f"Saved to {args.map}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", help="serial port, e.g. COM5 (default: the only one found)")
@@ -371,9 +436,15 @@ def main():
     s.add_argument("--speed-deg", type=float, default=40.0, help="max joint speed in deg/s")
     s.add_argument("--torque", type=float, default=50.0, help="torque limit in %% of the motor's maximum")
     s.add_argument("--stall-load", type=float, default=60.0, help="stop a joint pushing harder than this %%")
+    s = sub.add_parser("mirror", help="torque off: the sim copies the real arm, to check each joint's direction")
+    s.add_argument("--map", default=None, help="sim mapping file (default calibration/sim_map.json)")
     args = p.parse_args()
     if args.fake and args.file == str(calib.CALIBRATION_FILE):
         args.file = str(calib.FAKE_CALIBRATION_FILE)  # never overwrite the real arm's calibration
+    if getattr(args, "map", "") is None:
+        from so101_real import follower
+
+        args.map = str(follower.FAKE_SIM_MAP_FILE if args.fake else follower.SIM_MAP_FILE)
 
     if args.cmd == "ports":
         return cmd_ports(args)
@@ -383,7 +454,7 @@ def main():
         sys.exit(str(e))
     try:
         {"scan": cmd_scan, "setup-ids": cmd_setup_ids, "identify": cmd_identify, "calibrate": cmd_calibrate,
-         "show": cmd_show, "jog": cmd_jog}[args.cmd](args, bus)
+         "show": cmd_show, "jog": cmd_jog, "mirror": cmd_mirror}[args.cmd](args, bus)
     except BusError as e:
         sys.exit(f"\nError: {e}")
     except KeyboardInterrupt:

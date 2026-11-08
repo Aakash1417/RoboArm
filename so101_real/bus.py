@@ -91,6 +91,11 @@ class BaseBus:
         else:
             self._write(motor_id, reg.addr, reg.size, encode(value, reg.sign_bit))
 
+    def sync_write(self, name, values):
+        """{motor_id: value} for a RAM register; the real bus sends it as one packet."""
+        for i, v in values.items():
+            self.write(i, name, v)
+
     def torque_off(self, motor_id):
         """Limp, with the EEPROM lock open, as LeRobot does on Feetech servos. (Closing the lock
         goes with torque on; locking after each EEPROM write turned torque back on on a real arm.)"""
@@ -188,6 +193,18 @@ class SerialBus(BaseBus):
                 return
         raise BusError(f"motor {motor_id}: no reply writing address {addr} "
                        f"({self.packet.getTxRxResult(result)})")
+
+    def sync_write(self, name, values):
+        reg = REGS[name]
+        if reg.eeprom:
+            raise BusError(f"{name} is in EEPROM; write it per motor")
+        param = []
+        for i, v in values.items():
+            raw = encode(v, reg.sign_bit)
+            param += [i] + [(raw >> (8 * b)) & 0xFF for b in range(reg.size)]  # little-endian
+        result = self.packet.syncWriteTxOnly(self.port, reg.addr, reg.size, param, len(param))
+        if result != self._scs.COMM_SUCCESS:
+            raise BusError(f"sync write of {name} failed ({self.packet.getTxRxResult(result)})")
 
     def close(self):
         self.port.closePort()

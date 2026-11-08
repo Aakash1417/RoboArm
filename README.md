@@ -349,21 +349,22 @@ an unmoved joint isn't saved; ID changes work. Jogging was driven with scripted 
 at its max, `M` returns it to the middle, and a blocked joint is stopped. None of this has run on
 the real arm yet.
 
-## 9. Driving the physical arm from the hand tracking later (not implemented)
+## 9. Driving the physical arm with your hand (`main.py --real`)
 
-The output of `main.py` each tick is `arm_q` (5 joint angles in radians, in the model's "new calib"
-convention) plus `gripper_cmd` (radians). To drive the real follower arm:
+The sim model ("new calib") puts each joint's zero at the middle of its range, and calibration
+centred each servo's travel, so a sim angle maps to `ticks = middle of range + trim + sign * angle`
+(`so101_real/follower.py`). Direction and trim per joint are in `calibration/sim_map.json`.
 
-1. Use the calibration above (`arm.py calibrate`), and map each joint between the simulation's
-   radians and the servo's ticks around 2047 (one tick = 0.088°), checking direction and zero
-   offset joint by joint with `arm.py jog` and `joint_test.py` before enabling torque.
-2. The gripper is different: map this model's closed (about 0 rad) to open (about 1.745 rad)
-   onto the gripper's calibrated min..max ticks. The same file also works with LeRobot's
-   `SO101Follower` if you'd rather use LeRobot for this part.
-3. Send `arm_q` only after the simulation has accepted it, and keep all the limits: joint margins,
-   the speed cap, and the workspace box. Start with `--speed 0.1` and lower gains.
-4. Add a hardware e-stop or torque-off key, and rate-limit bus writes to about 30-50 Hz.
-5. Mirror the real joint readings back into the simulation for comparison.
+1. `python arm.py mirror`: torque off, the sim copies the real arm as you move it by hand. Every
+   joint must turn the same way as the real one: pick a joint with `1`-`6`, `F` flips it, `[` `]`
+   trim it by 2° (the wrist roll usually needs this, it has no end stops to centre on). `S` saves.
+   Keys go to the console window.
+2. `python main.py --real`: after Enter, torque comes on and the arm moves to the sim's home pose,
+   then follows the sim's joint commands at 50 Hz. Speed is capped at 90°/s (`--real-speed`), torque
+   at 50 % (`--real-torque`), and every goal is clamped to the calibrated limits. On quit it asks
+   whether to keep holding or go limp. `--fake-arm` tries it with the simulated bus.
+
+Start with `--real-speed 30`. `SPACE` (pause) in the hand window freezes the target.
 
 ## 10. Files
 
@@ -372,6 +373,7 @@ main.py                    app: two windows, control loop, keys, input modes
 arm.py                     physical arm: ports, scan, setup-ids, identify, calibrate, show, jog
 so101_real/bus.py          STS3215 registers, real serial bus, simulated bus (--fake)
 so101_real/calibration.py  centring, range recording, limits, calibration file
+so101_real/follower.py     sim angles <-> servo ticks, the arm following the sim (--real)
 calibration/               so101_follower.json after you calibrate the real arm
 joint_test.py              milestone 1: jog joints, see ranges
 selftest.py                headless checks (no webcam needed); --camera to test webcam
