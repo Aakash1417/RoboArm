@@ -139,11 +139,14 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode, latency_ms=None):
     trail_mm = 1000 * np.linalg.norm(teleop.goal - teleop.target)
     lines = [
         (f"Status: {teleop.status}", (0, 255, 0) if teleop.status == "TRACKING" else (0, 200, 255)),
-        (f"Gripper: {'CLOSED' if teleop.gripper.closed else 'OPEN'}",
+        (f"Gripper: {100 * teleop.grip_open:3.0f}% open" if mcfg.grip_mode == "proportional"
+         else f"Gripper: {'CLOSED' if teleop.gripper.closed else 'OPEN'}",
          (0, 0, 255) if teleop.gripper.closed else (0, 255, 0)),
         (f"Grip ratio ({f'{mcfg.grip_min_fingers} of 4 fingers' if mcfg.grip_mode == 'majority' else 'index pinch'}):"
          f" {teleop.last_pinch:.2f}"
-         f"  (close<{mcfg.grip_thresholds[0]:.2f} open>{mcfg.grip_thresholds[1]:.2f})", (255, 255, 255)),
+         + (f"  (closed at {mcfg.grip_thresholds[0]:.2f}, open at {mcfg.grip_thresholds[1]:.2f})"
+            if mcfg.grip_mode == "proportional" else
+            f"  (close<{mcfg.grip_thresholds[0]:.2f} open>{mcfg.grip_thresholds[1]:.2f})"), (255, 255, 255)),
         (("Finger scores (closed<1): " if mcfg.grip_mode == "majority" else "Thumb to: ")
          + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"), teleop.last_fingers)),
          (200, 200, 200)),
@@ -199,8 +202,12 @@ def parse_args():
     p.add_argument("--speed", type=float, default=None, help="max gripper target speed in m/s")
     p.add_argument("--depth", action="store_true", help="enable forward/back from hand size (estimate)")
     p.add_argument("--no-wrist", action="store_true", help="start with wrist roll tracking off (T toggles)")
-    p.add_argument("--grip", choices=["majority", "index"], default="majority",
-                   help="close the gripper when most fingertips touch the thumb, or on thumb-index pinch only")
+    p.add_argument("--grip", choices=["proportional", "majority", "index"], default="proportional",
+                   help="proportional: the gripper opens as wide as your thumb-index gap (default); "
+                        "majority: on/off when most fingertips touch the thumb; index: on/off thumb-index pinch")
+    p.add_argument("--reanchor", action="store_true",
+                   help="when the hand returns after leaving the view, don't move the arm to it "
+                        "(default: the arm goes back to where your hand is)")
     p.add_argument("--grip-fingers", type=int, default=None,
                    help="majority mode: how many of the 4 fingertips must touch the thumb (default 3)")
     p.add_argument("--ik", choices=["jaws", "wrist", "tip"], default="jaws",
@@ -214,6 +221,8 @@ def parse_args():
     p.add_argument("--port", help="with --real: the arm's serial port, e.g. COM6")
     p.add_argument("--real-speed", type=float, default=90.0, help="with --real: max joint speed in deg/s")
     p.add_argument("--real-torque", type=float, default=50.0, help="with --real: torque limit in %%")
+    p.add_argument("--real-gripper-speed", type=float, default=300.0,
+                   help="with --real: max gripper speed in deg/s (it has its own, faster cap)")
     return p.parse_args()
 
 
@@ -232,12 +241,15 @@ def connect_arm(args):
         sim_model = SO101Sim(Config().robot).model
         mapping = follower.Mapping(cal, follower.model_ranges(sim_model, list(cal)),
                                    follower.load_map(map_file, list(cal)))
-        arm = follower.RealArm(bus, cal, mapping, speed_deg=args.real_speed, torque=args.real_torque)
+        arm = follower.RealArm(bus, cal, mapping, speed_deg=args.real_speed, torque=args.real_torque,
+                               gripper_speed_deg=args.real_gripper_speed)
         print(f"REAL ARM: torque comes on and the arm moves to the sim's home pose at up to "
               f"{args.real_speed:g} deg/s (torque limit {args.real_torque:g} %), then follows your hand.\n"
               "Clear the space around it. SPACE in the hand window pauses; closing the windows stops it.")
         input("Ready? [Enter] ")
         arm.start()
+        for note in arm.notes:
+            print("Note:", note)
     except BaseException:
         bus.close()
         raise
@@ -261,6 +273,7 @@ def main():
     cfg.hand.process_width = args.process_width
     cfg.mapping.depth_enabled = args.depth
     cfg.mapping.grip_mode = args.grip
+    cfg.mapping.reanchor_on_loss = args.reanchor
     if args.grip_fingers is not None:
         cfg.mapping.grip_min_fingers = int(np.clip(args.grip_fingers, 1, 4))
     cfg.mapping.wrist_enabled = not args.no_wrist
@@ -345,7 +358,7 @@ def run(args, cfg, arm):
             target = teleop.step(dt)
             ik.set_wrist_roll(teleop.roll_target)
             arm_q = ik.solve(target, dt)
-            want = cfg.robot.gripper_closed if teleop.gripper.closed else cfg.robot.gripper_open
+            want = teleop.gripper_goal
             gripper_cmd += np.clip(want - gripper_cmd, -cfg.robot.gripper_speed * dt, cfg.robot.gripper_speed * dt)
             sim.set_command(arm_q, gripper_cmd)
             if arm is not None:

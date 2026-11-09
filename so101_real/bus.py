@@ -30,6 +30,9 @@ REGS = {
     "Min_Position_Limit": Reg(9, 2, eeprom=True),
     "Max_Position_Limit": Reg(11, 2, eeprom=True),
     "Max_Torque_Limit": Reg(16, 2, eeprom=True),     # 0..1000 = 0..100 % of stall torque
+    "P_Coefficient": Reg(21, 1, eeprom=True),         # position loop gains; factory 32 / 32 / 0
+    "D_Coefficient": Reg(22, 1, eeprom=True),
+    "I_Coefficient": Reg(23, 1, eeprom=True),
     "Homing_Offset": Reg(31, 2, sign_bit=11, eeprom=True),
     "Operating_Mode": Reg(33, 1, eeprom=True),        # 0 = position
     "Torque_Enable": Reg(40, 1),
@@ -226,18 +229,19 @@ class FakeBus(BaseBus):
         self.mem = {}
         self.raw, self.stops = {}, {}
         for i, r in raw.items():
-            self.mem[i] = {reg.addr: 0 for reg in REGS.values()}
-            self.mem[i][REGS["Model_Number"].addr] = STS3215_MODEL
-            self.mem[i][REGS["ID"].addr] = i
-            self.mem[i][REGS["Max_Position_Limit"].addr] = RESOLUTION - 1
-            self.mem[i][REGS["Max_Torque_Limit"].addr] = 1000
-            self.mem[i][REGS["Torque_Limit"].addr] = 1000
-            self.mem[i][REGS["Lock"].addr] = 1
-            self.mem[i][REGS["Present_Voltage"].addr] = 120
-            self.mem[i][REGS["Present_Temperature"].addr] = 30
+            self.mem[i] = self.factory_memory(i)
             self.raw[i] = float(r)
             self.stops[i] = stops.get(i, (r - 1000, r + 1000))  # raw ticks, may run past 0/4095
         self._last = time.perf_counter()
+
+    @staticmethod
+    def factory_memory(motor_id):
+        m = {reg.addr: 0 for reg in REGS.values()}
+        for name, v in {"Model_Number": STS3215_MODEL, "ID": motor_id, "Max_Position_Limit": RESOLUTION - 1,
+                        "Max_Torque_Limit": 1000, "Torque_Limit": 1000, "Lock": 1, "Present_Voltage": 120,
+                        "Present_Temperature": 30, "P_Coefficient": 32, "D_Coefficient": 32}.items():
+            m[REGS[name].addr] = v
+        return m
 
     def ping(self, motor_id):
         return STS3215_MODEL if motor_id in self.mem else None
@@ -306,7 +310,9 @@ class FakeBus(BaseBus):
             bus.mem = {i: {int(a): x for a, x in v["mem"].items()} for i, v in data.items()}
             bus.raw = {i: v["raw"] for i, v in data.items()}
             bus.stops = {i: tuple(v["stops"]) for i, v in data.items()}
-            for m in bus.mem.values():
+            for i, m in bus.mem.items():
+                for addr, v in cls.factory_memory(i).items():
+                    m.setdefault(addr, v)  # registers added since the state was saved
                 m[REGS["Torque_Enable"].addr] = 0  # like a power cycle
         bus.state_file = path
         return bus

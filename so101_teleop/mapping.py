@@ -93,7 +93,7 @@ def grip_ratio(obs: HandObservation, cfg: MappingConfig) -> float:
         scores = finger_scores(obs, cfg)
         k = int(np.clip(cfg.grip_min_fingers, 1, len(scores)))
         return sorted(scores)[k - 1]
-    return obs.pinch_ratio
+    return obs.pinch_ratio  # "index" and "proportional"
 
 
 class GripperHysteresis:
@@ -162,6 +162,8 @@ class Teleop:
         self._filtered = None
         self.velocity = np.zeros(3)
         self.roll_velocity = np.zeros(1)
+        self._grip_euro = OneEuroFilter(c.grip_min_cutoff, c.grip_beta)
+        self.grip_open = 1.0  # 0 = closed .. 1 = open
         self._neutral_hand = None
         self._neutral_target = self.home_target.copy()
         self._neutral_roll = self.roll_home
@@ -211,9 +213,10 @@ class Teleop:
             # Hold position. After a short dropout the old neutral still applies; after a longer
             # one the returning hand re-anchors, like lifting a mouse off the desk.
             self._lost_frames += 1
-            if self._lost_frames >= self.cfg.reanchor_frames:
+            if self.cfg.reanchor_on_loss and self._lost_frames >= self.cfg.reanchor_frames:
                 self._needs_calibration = True
             self._euro.reset()
+            self._grip_euro.reset()
             self._smoothed = None
             self._filtered = None
             self.hand_angle = float("nan")
@@ -240,7 +243,13 @@ class Teleop:
 
         if self.paused:
             return
-        self.gripper.update(self.last_pinch)
+        if self.cfg.grip_mode == "proportional":
+            lo, hi = self.cfg.grip_thresholds
+            self.grip_open = float(np.clip(self._grip_euro(np.array([self.last_pinch]), t)[0] - lo, 0, hi - lo)
+                                   / (hi - lo))
+            self.gripper.closed = self.grip_open < 0.5
+        else:
+            self.grip_open = 0.0 if self.gripper.update(self.last_pinch) else 1.0
         if self.homing:
             return
 
@@ -281,6 +290,12 @@ class Teleop:
             self.homing = False
             self.calibrate()
         return self.target
+
+    @property
+    def gripper_goal(self):
+        """Gripper joint angle (rad) for the current grip_open."""
+        r = self.rcfg
+        return r.gripper_closed + (r.gripper_open - r.gripper_closed) * self.grip_open
 
     def clamp_workspace(self, p):
         r = self.rcfg

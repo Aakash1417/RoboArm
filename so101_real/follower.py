@@ -81,21 +81,39 @@ def load_checked(bus, path):
 class RealArm:
     """Follows sim joint angles. The servos' own speed and torque limits soften every move."""
 
-    def __init__(self, bus, cal, mapping, speed_deg=90.0, torque=50.0, rate_hz=50.0):
+    # LeRobot's SO-101 follower gains: P 16 instead of the factory 32 "to avoid shakiness".
+    GAINS = {"P_Coefficient": 16, "I_Coefficient": 0, "D_Coefficient": 32}
+    ACCELERATION = 100  # x100 ticks/s^2 (~880 deg/s^2): the commands are already accel-limited
+
+    def __init__(self, bus, cal, mapping, speed_deg=90.0, torque=50.0, rate_hz=50.0, gripper_speed_deg=300.0):
         self.bus, self.cal, self.mapping = bus, cal, mapping
         self.names = list(cal)
-        self.speed_deg, self.torque = speed_deg, torque
+        self.speed_deg, self.torque, self.gripper_speed_deg = speed_deg, torque, gripper_speed_deg
         self.period = 1.0 / rate_hz
         self._next = 0.0
         self.on = False
+        self.notes = []
+
+    def _tune(self, motor_id):
+        """Write GAINS (EEPROM, so only when they differ). Skipped if P reads as something no STS3215
+        ships with, since then this firmware's registers aren't where we expect."""
+        p = self.bus.read(motor_id, "P_Coefficient")
+        if not 8 <= p <= 64:
+            self.notes.append(f"motor {motor_id}: P gain reads {p}, left the gains alone")
+            return
+        for name, v in self.GAINS.items():
+            if self.bus.read(motor_id, name) != v:
+                self.bus.write(motor_id, name, v)
 
     def start(self):
         """Torque on, holding where the arm is. Refused if a joint sits well outside its limits."""
         far = []
-        for c in self.cal.values():
+        for n, c in self.cal.items():
             self.bus.torque_off(c.id)
-            self.bus.write(c.id, "Acceleration", 20)
-            self.bus.write(c.id, "Goal_Speed", int(self.speed_deg * RESOLUTION / 360))
+            self._tune(c.id)
+            speed = self.gripper_speed_deg if n == "gripper" else self.speed_deg
+            self.bus.write(c.id, "Acceleration", self.ACCELERATION)
+            self.bus.write(c.id, "Goal_Speed", int(speed * RESOLUTION / 360))
             self.bus.write(c.id, "Torque_Limit", int(self.torque * 10))
             pos = self.bus.read(c.id, "Present_Position")
             if not c.range_min - SNAP_TICKS <= pos <= c.range_max + SNAP_TICKS:

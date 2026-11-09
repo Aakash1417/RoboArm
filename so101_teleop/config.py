@@ -29,7 +29,7 @@ class RobotConfig:
     # Larger value = more open. Slightly negative "closed" squeezes objects.
     gripper_open: float = 1.2
     gripper_closed: float = -0.1
-    gripper_speed: float = 4.0  # rad/s
+    gripper_speed: float = 10.0  # rad/s (closed to open in 0.13 s)
 
     # Cartesian workspace box for the IK target, in world metres (robot base at the origin).
     # +X = forward (away from you), +Y = robot's left, +Z = up. Table top is at Z = 0.
@@ -105,8 +105,11 @@ class MappingConfig:
     euro_d_cutoff: float = 1.0
     dead_zone: float = 0.002  # normalized image units of hand jitter that are ignored
     depth_dead_zone: float = 0.03
-    # Clutch behaviour: after the hand has been gone this many camera frames (~0.25 s), its new
-    # position maps to wherever the robot is, so the arm never moves toward a re-appearing hand.
+    # When the hand comes back after leaving the view, by default the same hand-to-robot mapping
+    # still applies: the arm (smoothly) goes to where your hand now is, like an absolute pointer.
+    # reanchor_on_loss = True instead re-anchors after reanchor_frames (~0.25 s) without the hand,
+    # so the re-appearing hand maps to wherever the robot is and it doesn't move (like a mouse).
+    reanchor_on_loss: bool = False
     reanchor_frames: int = 8
     # When the target hits the workspace edge, slide the neutral point along with it, so moving
     # your hand back responds immediately instead of first having to return to where it crossed.
@@ -118,7 +121,13 @@ class MappingConfig:
     #                 - it is curled into a fist: tip-to-wrist / knuckle-to-wrist < curl_below.
     #               The gripper closes when at least grip_min_fingers fingers are closed.
     #   "index":    thumb-index pinch only.
-    grip_mode: str = "majority"
+    #   "proportional" (default): the gripper opens as far as your thumb and index finger are apart,
+    #               pinch_ratio grip_closed_at -> fully closed, grip_open_at -> fully open.
+    grip_mode: str = "proportional"
+    grip_closed_at: float = 0.20
+    grip_open_at: float = 0.90
+    grip_min_cutoff: float = 2.0  # One Euro on the pinch ratio (Hz)
+    grip_beta: float = 2.0
     grip_min_fingers: int = 3  # out of 4; 4 = all fingers, 2 = thumb plus any two
     touch_below: float = 0.45
     curl_below: float = 1.0
@@ -133,6 +142,8 @@ class MappingConfig:
     def grip_thresholds(self):
         if self.grip_mode == "majority":
             return 1.0, self.open_score
+        if self.grip_mode == "proportional":
+            return self.grip_closed_at, self.grip_open_at
         return self.pinch_close_below, self.pinch_open_above
 
 

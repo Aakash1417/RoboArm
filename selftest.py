@@ -70,7 +70,7 @@ class Rig:
             self.trace.append((i * self.dt, target.copy()))
             self.ik.set_wrist_roll(self.teleop.roll_target)
             arm_q = self.ik.solve(target, self.dt)
-            want = self.cfg.robot.gripper_closed if self.teleop.gripper.closed else self.cfg.robot.gripper_open
+            want = self.teleop.gripper_goal
             s = self.cfg.robot.gripper_speed * self.dt
             self.grip += np.clip(want - self.grip, -s, s)
             self.sim.set_command(arm_q, self.grip)
@@ -182,6 +182,21 @@ def test_pipeline(ik_mode):
     check("hand down -> gripper moves down (-Z)", p[2] - home[2] < -0.03, f"(dz {p[2] - home[2]:+.3f} m)")
     rig.run(2.0, hand())
 
+    grips = []
+    for pinch in (0.9, 0.55, 0.2, 0.9):
+        rig.run(0.6, hand(pinch=pinch))
+        grips.append(rig.sim.joint_q[5])
+    lo, hi = rig.cfg.robot.gripper_closed, rig.cfg.robot.gripper_open
+    check("proportional grip: thumb-index gap sets how far the gripper opens (wide, half, pinched, wide)",
+          grips[0] > hi - 0.1 and abs(grips[1] - (lo + hi) / 2) < 0.15 and grips[2] < lo + 0.15
+          and grips[3] > hi - 0.1, f"({np.round(grips, 2)} rad)")
+    rig.run(0.2, hand(pinch=0.9))
+    g0 = rig.sim.joint_q[5]
+    rig.run(0.15, hand(pinch=0.2))
+    check("proportional grip: the gripper command closes in under 0.15 s", rig.grip < lo + 0.05,
+          f"({g0:+.2f} -> {rig.grip:+.2f} rad in 0.15 s; the sim's servo model itself moves ~5 rad/s)")
+
+    tp.cfg.grip_mode = "majority"
     rig.run(1.0, hand(pinch=0.1))
     g_closed = rig.sim.joint_q[5]
     rig.run(1.0, hand(pinch=0.8))
@@ -228,9 +243,17 @@ def test_pipeline(ik_mode):
     check("hand lost -> robot holds position", np.linalg.norm(after - before) < 0.01,
           f"(moved {np.linalg.norm(after - before) * 1000:.1f} mm in 3 s)")
 
-    p = rig.run(2.0, hand(x=0.9, y=0.1))
-    check("hand comes back somewhere else -> arm stays put (re-anchored, like lifting a mouse)",
-          np.linalg.norm(p - after) < 0.01, f"(moved {np.linalg.norm(p - after) * 1000:.1f} mm)")
+    p = rig.run(2.0, hand(x=0.5, y=0.45))
+    expected = 0.1 * rig.cfg.mapping.gain_xy
+    check("hand comes back somewhere else -> arm goes to where that hand maps (same anchor as before)",
+          abs((after[1] - p[1]) - expected) < 0.01, f"(dy {p[1] - after[1]:+.3f} m, expected {-expected:+.3f})")
+    tp.cfg.reanchor_on_loss = True
+    rig.run(1.0, lambda t: None)
+    before = rig.pos
+    p = rig.run(2.0, hand(x=0.4, y=0.45))
+    check("--reanchor: hand comes back somewhere else -> arm stays put (like lifting a mouse)",
+          np.linalg.norm(p - before) < 0.01, f"(moved {np.linalg.norm(p - before) * 1000:.1f} mm)")
+    tp.cfg.reanchor_on_loss = False
     rig.run(1.0, lambda t: None)
     p0 = rig.run(1.0, hand(x=0.5, y=0.5))
     blink = iter([None] * 3 + [hand(x=0.4, y=0.5)] * 1000)  # 0.1 s dropout, hand reappears 0.1 to the left
@@ -247,7 +270,7 @@ def test_pipeline(ik_mode):
     check("from the workspace edge, moving back responds immediately (sliding anchor)", t[1] - p[1] > 0.05,
           f"(y {t[1]:+.3f} -> {p[1]:+.3f} m)")
     rig.run(1.0, lambda t: None)
-    rig.run(1.0, hand())
+    rig.run(3.0, hand())  # the returning hand takes the arm back to where it maps
 
     tp.toggle_pause()
     before = rig.sim.ee_pos
@@ -476,6 +499,9 @@ def test_arm_tools():
         bus.move_by_hand(i, (lo + hi) / 2)
     arm = follower.RealArm(bus, cal, mapping, speed_deg=3000)
     arm.start()
+    check("arm: following uses LeRobot's servo gains (P 16, I 0, D 32) and a faster gripper speed",
+          all((bus.read(i, "P_Coefficient"), bus.read(i, "I_Coefficient"), bus.read(i, "D_Coefficient"))
+              == (16, 0, 32) for i in calib.JOINTS.values()) and not arm.notes)
     want = [0.2, -0.3, 0.4, 0.1, -0.5, 0.6]
     for _ in range(30):
         arm.send(want)

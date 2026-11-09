@@ -52,6 +52,10 @@ If you activate the venv first (`.\.venv\Scripts\Activate.ps1`), plain `python m
 If PowerShell blocks activation, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once,
 or just use the full `.\.venv\Scripts\python.exe` path as above.
 
+The gripper follows your thumb-index gap proportionally (`--grip majority` or `--grip index` for
+on/off). When your hand leaves the view and comes back, the arm smoothly goes back to where your
+hand now maps; `--reanchor` makes it stay put instead.
+
 Useful options: `--sensitivity 1.5`, `--min-cutoff 0.5` (steadier when still, laggier),
 `--beta 15` (less lag when moving, a little more jitter),
 `--speed 0.2` (max target speed in m/s), `--depth` (forward/back estimate on at start),
