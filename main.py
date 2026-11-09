@@ -47,8 +47,8 @@ class WebcamSource:
               f"{self.camera.resolution[0]}x{self.camera.resolution[1]}, processing at width {cfg.process_width}.")
 
     def poll(self):
-        """Returns (frame, observation, landmark_pixels) for a new frame, or None if no new frame."""
-        frame_id, frame = self.camera.latest()
+        """Returns (frame, observation, landmark_pixels, capture_time) for a new frame, or None."""
+        frame_id, frame, t = self.camera.latest_timed()
         if frame is None or frame_id == self._last_id:
             return None
         self._last_id = frame_id
@@ -58,7 +58,7 @@ class WebcamSource:
                                interpolation=cv2.INTER_AREA)
         frame = cv2.flip(frame, 1)  # mirror so moving your hand left moves it left on screen
         obs, px = self.tracker.detect(frame)
-        return frame, obs, px
+        return frame, obs, px, t
 
     def handle_key(self, key):
         return False
@@ -96,7 +96,7 @@ class VirtualHandSource:
         cv2.putText(frame, f"{self.mode.upper()} INPUT (no webcam)", (10, 340), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200, 200, 200), 1, cv2.LINE_AA)
         if not self.visible:
-            return frame, None, None
+            return frame, None, None, now
         c = (int(self.x * 640), int(self.y * 360))
         r = int(self.size * 640 / 2)
         cv2.circle(frame, c, r, (0, 0, 255) if self.pinched else (0, 255, 0), 2, cv2.LINE_AA)
@@ -105,7 +105,7 @@ class VirtualHandSource:
         cv2.line(frame, c, tip, (255, 255, 255), 2, cv2.LINE_AA)  # "fingers" direction
         r = 0.1 if self.pinched else 0.8
         obs = HandObservation(self.x, self.y, self.size, r, (r, r, r, r), self.angle, (1.8,) * 4)
-        return frame, obs, None
+        return frame, obs, None, now
 
     def handle_key(self, key):
         if self.mode != "keyboard":
@@ -135,7 +135,8 @@ class VirtualHandSource:
         pass
 
 
-def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
+def draw_hud(img, teleop, sim, mcfg, cam_fps, mode, latency_ms=None):
+    trail_mm = 1000 * np.linalg.norm(teleop.goal - teleop.target)
     lines = [
         (f"Status: {teleop.status}", (0, 255, 0) if teleop.status == "TRACKING" else (0, 200, 255)),
         (f"Gripper: {'CLOSED' if teleop.gripper.closed else 'OPEN'}",
@@ -147,6 +148,8 @@ def draw_hud(img, teleop, sim, mcfg, cam_fps, mode):
          + "  ".join(f"{n} {r:.2f}" for n, r in zip(("index", "middle", "ring", "pinky"), teleop.last_fingers)),
          (200, 200, 200)),
         (f"Camera FPS: {cam_fps:4.1f}   Sensitivity: x{teleop.sensitivity:.2f}", (255, 255, 255)),
+        (f"Latency camera->command: {'--' if latency_ms is None else f'{latency_ms:3.0f}'} ms"
+         f"   target trailing hand: {trail_mm:3.0f} mm", (255, 255, 255)),
         (f"Depth (forward/back): {'ON - ESTIMATE from hand size' if mcfg.depth_enabled else 'OFF'}",
          (255, 255, 0) if mcfg.depth_enabled else (180, 180, 180)),
         (f"Wrist roll: {'ON' if mcfg.wrist_enabled else 'OFF'}   hand twist {math.degrees(teleop.hand_angle):+4.0f} deg"
@@ -189,7 +192,10 @@ def parse_args():
     p.add_argument("--height", type=int, default=1080, help="requested capture height")
     p.add_argument("--process-width", type=int, default=640, help="resize frames to this width for tracking")
     p.add_argument("--sensitivity", type=float, default=1.0, help="multiplier on hand-to-robot gain")
-    p.add_argument("--smoothing", type=float, default=None, help="EMA factor 0..1 (lower = smoother)")
+    p.add_argument("--min-cutoff", type=float, default=None,
+                   help="One Euro filter: Hz for a still hand (default 1.0; lower = steadier, laggier)")
+    p.add_argument("--beta", type=float, default=None,
+                   help="One Euro filter: speed response (default 10; higher = less lag when moving)")
     p.add_argument("--speed", type=float, default=None, help="max gripper target speed in m/s")
     p.add_argument("--depth", action="store_true", help="enable forward/back from hand size (estimate)")
     p.add_argument("--no-wrist", action="store_true", help="start with wrist roll tracking off (T toggles)")
@@ -258,8 +264,10 @@ def main():
     if args.grip_fingers is not None:
         cfg.mapping.grip_min_fingers = int(np.clip(args.grip_fingers, 1, 4))
     cfg.mapping.wrist_enabled = not args.no_wrist
-    if args.smoothing is not None:
-        cfg.mapping.smoothing = float(np.clip(args.smoothing, 0.01, 1.0))
+    if args.min_cutoff is not None:
+        cfg.mapping.euro_min_cutoff = max(args.min_cutoff, 0.01)
+    if args.beta is not None:
+        cfg.mapping.euro_beta = max(args.beta, 0.0)
     if args.speed is not None:
         cfg.robot.max_target_speed = args.speed
 
@@ -294,7 +302,7 @@ def run(args, cfg, arm):
     display_w = min(960, screen_w // 2 - 20)
     cv2.moveWindow(WINDOW, screen_w - display_w - 20, 40)  # MuJoCo opens on the left, webcam on the right
     gripper_cmd = cfg.robot.gripper_open
-    cam_fps, last_frame_t = 0.0, None
+    cam_fps, last_frame_t, latency_ms = 0.0, None, None
     n_frames = n_hand = n_ticks = 0
     print("Controls (focus the hand-tracking window): Q quit, SPACE pause, C calibrate, R home, "
           "F depth, T wrist roll, +/- sensitivity. Drag in the MuJoCo window to rotate the view.")
@@ -314,11 +322,13 @@ def run(args, cfg, arm):
 
             polled = source.poll()
             if polled is not None:
-                frame, obs, px = polled
+                frame, obs, px, captured = polled
                 if last_frame_t is not None:
                     cam_fps += 0.1 * (1.0 / max(now - last_frame_t, 1e-3) - cam_fps)
                 last_frame_t = now
-                teleop.observe(obs)
+                teleop.observe(obs, captured)
+                ms = 1000 * (time.perf_counter() - captured)
+                latency_ms = ms if latency_ms is None else latency_ms + 0.1 * (ms - latency_ms)
                 n_frames += 1
                 n_hand += obs is not None
                 zoom = display_w / frame.shape[1]
@@ -329,7 +339,7 @@ def run(args, cfg, arm):
                     if cfg.mapping.grip_mode != "majority":
                         fingers = fingers[:1]
                     source.draw_hand(view, px * zoom, fingers, teleop.gripper.closed)
-                draw_hud(view, teleop, sim, cfg.mapping, cam_fps, args.input)
+                draw_hud(view, teleop, sim, cfg.mapping, cam_fps, args.input, latency_ms)
                 cv2.imshow(WINDOW, view)
 
             target = teleop.step(dt)

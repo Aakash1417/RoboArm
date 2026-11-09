@@ -52,7 +52,8 @@ If you activate the venv first (`.\.venv\Scripts\Activate.ps1`), plain `python m
 If PowerShell blocks activation, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once,
 or just use the full `.\.venv\Scripts\python.exe` path as above.
 
-Useful options: `--sensitivity 1.5`, `--smoothing 0.2` (lower = smoother, laggier),
+Useful options: `--sensitivity 1.5`, `--min-cutoff 0.5` (steadier when still, laggier),
+`--beta 15` (less lag when moving, a little more jitter),
 `--speed 0.2` (max target speed in m/s), `--depth` (forward/back estimate on at start),
 `--width 1280 --height 720` (capture size), `--process-width 480` (faster tracking),
 `--backend dshow` (alternative camera driver).
@@ -148,10 +149,16 @@ webcam (1080p, thread) -> resize to 640 px -> mirror -> MediaPipe HandLandmarker
     hand toward the camera. If your fingers point straight at the camera, the angle is unreliable.
 - **Depth (optional)** uses the change in apparent palm size relative to calibration. It's noisy,
   and it also changes if you tilt your hand. It isn't depth-camera data.
-- **Smoothing:** an exponential moving average (`smoothing`), followed by a backlash-style dead zone
-  (`dead_zone`). The dead zone ignores tiny jitter without causing steps. On top of that, the target
-  point can't move faster than `max_target_speed` (0.35 m/s), so re-acquiring the hand far away, or
-  pressing `R`, produces a gradual, bounded motion.
+- **Smoothing:** a [One Euro filter](https://gery.casiez.net/1euro/) on the hand (`euro_*` in
+  `config.py`). Its cutoff rises with hand speed, so a still hand is smoothed hard and a moving one
+  barely lags. A small backlash-style dead zone (`dead_zone`) follows it. The target point then
+  moves toward the hand with capped speed (`max_target_speed`, 0.35 m/s) and acceleration
+  (`max_target_accel`, 2.5 m/s²), so it eases in and out instead of stepping at the camera's 30 Hz,
+  and re-acquiring the hand far away, or pressing `R`, gives a gradual, bounded motion.
+- **Measured** (`selftest.py`, synthetic 30 Hz frames): a still hand with MediaPipe-like jitter
+  (0.003 image widths) moves the target 0.13 mm rms instead of 1.65 mm; a calm sweep is followed
+  75 ms behind. The overlay shows the live camera-to-command latency (capture, MediaPipe, mapping)
+  and how far the target trails the hand.
 - **Gripper:** each of index, middle, ring and pinky counts as closed in either of two ways. Both
   use MediaPipe's 3D hand landmarks and divide one hand distance by another, so they don't depend
   on how far your hand is from the camera, and tilting your hand doesn't make fingers look closer
@@ -190,8 +197,8 @@ All tunables live in `so101_teleop/config.py`: gains, thresholds, home pose, wor
    fist) should read below 1.0, and an open hand well above 1.4. If a gesture doesn't register,
    raise `touch_below` or `curl_below` in `config.py` a little, or change how many fingers are
    needed with `--grip-fingers`.
-4. If the motion is too twitchy, lower `--smoothing` (for example 0.2) or raise `dead_zone`. If it's
-   too laggy, raise `--smoothing` (for example 0.5).
+4. If the arm shimmers while your hand is still, lower `--min-cutoff` (for example 0.5). If it
+   lags when you move, raise `--beta` (for example 15).
 5. If your movements feel too small or too big, use `+` / `-`, or `--sensitivity`.
 
 ## 5. Troubleshooting

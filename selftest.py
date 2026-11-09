@@ -48,6 +48,9 @@ class Rig:
         self.grip = self.cfg.robot.gripper_open
         self.dt = 0.01
         self.max_target_speed = 0.0
+        self.max_target_accel = 0.0
+        self.t = 0.0
+        self.trace = []
         self.max_joint_speed = 0.0
         self.limit_violation = 0.0
 
@@ -56,10 +59,15 @@ class Rig:
         lo, hi = self.sim.ctrl_lo, self.sim.ctrl_hi
         for i in range(steps):
             if i % 3 == 0:
-                self.teleop.observe(obs_fn(i * self.dt))
+                self.t += 3 * self.dt
+                self.teleop.observe(obs_fn(i * self.dt), self.t)
             prev = self.teleop.target.copy()
+            prev_v = self.teleop.velocity.copy()
             target = self.teleop.step(self.dt)
             self.max_target_speed = max(self.max_target_speed, np.linalg.norm(target - prev) / self.dt)
+            self.max_target_accel = max(self.max_target_accel,
+                                        np.linalg.norm(self.teleop.velocity - prev_v) / self.dt)
+            self.trace.append((i * self.dt, target.copy()))
             self.ik.set_wrist_roll(self.teleop.roll_target)
             arm_q = self.ik.solve(target, self.dt)
             want = self.cfg.robot.gripper_closed if self.teleop.gripper.closed else self.cfg.robot.gripper_open
@@ -84,6 +92,38 @@ class Rig:
 def hand(x=0.5, y=0.5, size=0.12, pinch=0.8, fingers=None, angle=0.0, curls=(1.8,) * 4):
     fingers = fingers or (pinch,) * 4
     return lambda t: HandObservation(x, y, size, fingers[0], tuple(fingers), angle, tuple(curls))
+
+
+def test_motion_quality():
+    """Hand -> target on synthetic 30 Hz frames: jitter when still, lag when moving, smoothness."""
+    rng = np.random.default_rng(0)
+    sigma = 0.003  # MediaPipe-like palm jitter, in image widths
+    rig = Rig()
+    rig.run(1.0, hand())
+    rig.trace.clear()
+    rig.run(3.0, lambda t: hand(x=0.5 + rng.normal(0, sigma), y=0.5 + rng.normal(0, sigma))(t))
+    pts = np.array([p for _, p in rig.trace[100:]])
+    jitter = 1000 * pts.std(axis=0).max()
+    raw = 1000 * sigma * rig.cfg.mapping.gain_xy
+    check("motion: a still, jittery hand barely moves the target", jitter < 0.2 * raw,
+          f"({jitter:.2f} mm rms, {raw:.2f} mm without filtering)")
+
+    f, amp = 0.5, 0.1  # a calm side-to-side sweep: 11 cm of robot motion, 0.17 m/s at its fastest
+    rig = Rig()
+    rig.run(1.0, hand())
+    rig.trace.clear()
+    rig.run(6.0, lambda t: hand(x=0.5 + amp * np.sin(2 * np.pi * f * t))(t))
+    ts = np.array([t for t, _ in rig.trace])
+    y = np.array([p[1] for _, p in rig.trace])
+    keep = ts > 2.0
+    lags = np.arange(0, 0.5, 0.005)
+    corr = [np.corrcoef(y[keep], -np.sin(2 * np.pi * f * (ts[keep] - lag)))[0, 1] for lag in lags]
+    lag_ms = 1000 * lags[int(np.argmax(corr))]
+    check("motion: a moving hand is followed with little lag (filter + speed/accel limits)", lag_ms < 120,
+          f"({lag_ms:.0f} ms behind; plus the camera->command latency shown live in main.py)")
+    check("motion: target acceleration stays within its cap",
+          rig.max_target_accel <= rig.cfg.robot.max_target_accel * 1.01,
+          f"(max {rig.max_target_accel:.2f} m/s^2, cap {rig.cfg.robot.max_target_accel})")
 
 
 def test_model():
@@ -484,6 +524,7 @@ if __name__ == "__main__":
     for mode in ("jaws", "wrist", "tip"):
         test_ik_grid(mode)
         test_pipeline(mode)
+    test_motion_quality()
     test_snapshots()
     test_mediapipe()
     test_arm_tools()

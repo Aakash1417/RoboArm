@@ -1,5 +1,6 @@
 """Turns hand observations into a smooth, bounded Cartesian target and a gripper command."""
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,60 @@ class HandObservation:
 
 def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+class OneEuroFilter:
+    """One Euro filter (Casiez et al., CHI 2012): a low-pass whose cutoff rises with speed, so a
+    still hand is smoothed hard (no jitter) while a fast one is followed with little lag.
+    cutoff = min_cutoff + beta * |filtered speed|, per channel."""
+
+    def __init__(self, min_cutoff, beta, d_cutoff=1.0):
+        self.min_cutoff = np.asarray(min_cutoff, dtype=float)
+        self.beta = np.asarray(beta, dtype=float)
+        self.d_cutoff = d_cutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        return 1.0 / (1.0 + 1.0 / (2 * np.pi * cutoff * dt))
+
+    def reset(self):
+        self.x = None
+
+    def __call__(self, x, t):
+        x = np.asarray(x, dtype=float)
+        if self.x is None:
+            self.x, self.dx, self.t = x.copy(), np.zeros_like(x), t
+            return self.x.copy()
+        dt = max(t - self.t, 1e-3)
+        self.t = t
+        self.dx += self._alpha(self.d_cutoff, dt) * ((x - self.x) / dt - self.dx)
+        self.x += self._alpha(self.min_cutoff + self.beta * np.abs(self.dx), dt) * (x - self.x)
+        return self.x.copy()
+
+
+def approach(pos, vel, goal, vmax, amax, response, dt):
+    """One step toward goal with capped speed and acceleration. The wanted speed is
+    response * distance (so a moving goal is followed about 1/response s behind, without the
+    stop-start of snapping onto it), never more than vmax or than braking at amax allows.
+    Works on vectors (by length) and on 1-element arrays."""
+    delta = goal - pos
+    dist = np.linalg.norm(delta)
+    if dist < 1e-9:
+        want = np.zeros_like(vel)
+    else:
+        want = delta / dist * min(vmax, np.sqrt(2 * amax * dist), response * dist)
+    dv = want - vel
+    n = np.linalg.norm(dv)
+    if n > amax * dt:
+        dv *= amax * dt / n
+    vel = vel + dv
+    return pos + vel * dt, vel
+
+
+def stopping_point(pos, vel, amax):
+    """Where braking at amax from vel comes to rest."""
+    return pos + vel * np.linalg.norm(vel) / (2 * amax)
 
 
 def finger_scores(obs: HandObservation, cfg: MappingConfig) -> tuple:
@@ -72,8 +127,8 @@ class Teleop:
 
     target = neutral_target + gain * (hand - neutral_hand), where "neutral" is captured on the
     first detection and whenever you calibrate, resume, finish homing, or bring your hand back after
-    losing it. The commanded target then moves toward that goal no faster than max_target_speed,
-    so the robot never jumps. The target is the gripper tip or the wrist joint, depending on the IK.
+    losing it. The hand is One Euro filtered, and the commanded target moves toward the goal
+    with capped speed and acceleration, so the robot never jumps or jerks. The target is the gripper tip or the wrist joint, depending on the IK.
     """
 
     def __init__(self, map_cfg: MappingConfig, robot_cfg: RobotConfig, home_target, roll_limits=(-np.pi, np.pi),
@@ -100,8 +155,13 @@ class Teleop:
         self.last_pinch = float("nan")
         self.last_fingers = ()
         self._needs_calibration = True
-        self._ema = None
+        c = map_cfg
+        self._euro = OneEuroFilter([c.euro_min_cutoff] * 2 + [c.euro_min_cutoff_depth, c.euro_min_cutoff_roll],
+                                   [c.euro_beta] * 2 + [c.euro_beta_depth, c.euro_beta_roll], c.euro_d_cutoff)
+        self._smoothed = None
         self._filtered = None
+        self.velocity = np.zeros(3)
+        self.roll_velocity = np.zeros(1)
         self._neutral_hand = None
         self._neutral_target = self.home_target.copy()
         self._neutral_roll = self.roll_home
@@ -115,8 +175,14 @@ class Teleop:
         self.paused = not self.paused
         if not self.paused:
             self.calibrate()  # resume like a clutch: wherever your hand is now maps to "here"
-        self.goal = self.target.copy()
-        self.roll_goal = self.roll_target
+        self._hold()
+
+    def _hold(self):
+        """Stop where braking can, without a jolt."""
+        r = self.rcfg
+        self.goal = self.clamp(stopping_point(self.target, self.velocity, r.max_target_accel))
+        roll = stopping_point(np.array([self.roll_target]), self.roll_velocity, r.max_roll_accel)[0]
+        self.roll_goal = float(np.clip(roll, *self.roll_limits))
 
     def reset_home(self):
         self.homing = True
@@ -137,7 +203,9 @@ class Teleop:
         self.calibrate()
 
     # ---- per camera frame ----------------------------------------------------------------
-    def observe(self, obs: HandObservation | None):
+    def observe(self, obs: HandObservation | None, t=None):
+        """t: when the frame was captured (perf_counter seconds); now if not given."""
+        t = time.perf_counter() if t is None else t
         self.tracking = obs is not None
         if obs is None:
             # Hold position. After a short dropout the old neutral still applies; after a longer
@@ -145,12 +213,12 @@ class Teleop:
             self._lost_frames += 1
             if self._lost_frames >= self.cfg.reanchor_frames:
                 self._needs_calibration = True
-            self._ema = None
+            self._euro.reset()
+            self._smoothed = None
             self._filtered = None
             self.hand_angle = float("nan")
             if not self.homing:
-                self.goal = self.target.copy()
-                self.roll_goal = self.roll_target
+                self._hold()
             return
 
         self._lost_frames = 0
@@ -158,16 +226,16 @@ class Teleop:
         self.last_fingers = finger_scores(obs, self.cfg) if self.cfg.grip_mode == "majority" else obs.finger_ratios
         self.hand_angle = obs.angle
         meas = np.array([obs.x, obs.y, np.log(max(obs.size, 1e-4)), obs.angle])
-        if self._ema is None:
-            self._ema = meas.copy()
+        if self._smoothed is None:
+            self._smoothed = self._euro(meas, t)
             self._filtered = meas.copy()
         else:
-            meas[3] = self._ema[3] + wrap_angle(meas[3] - self._ema[3])  # no jump across +/-180 deg
-            self._ema += self.cfg.smoothing * (meas - self._ema)
+            meas[3] = self._smoothed[3] + wrap_angle(meas[3] - self._smoothed[3])  # no jump across +/-180 deg
+            self._smoothed = self._euro(meas, t)
             # Dead zone as backlash: output only follows once the hand moves beyond the band.
             band = np.array([self.cfg.dead_zone, self.cfg.dead_zone, self.cfg.depth_dead_zone,
                              self.cfg.roll_dead_zone])
-            diff = self._ema - self._filtered
+            diff = self._smoothed - self._filtered
             self._filtered += np.sign(diff) * np.maximum(np.abs(diff) - band, 0.0)
 
         if self.paused:
@@ -199,15 +267,15 @@ class Teleop:
 
     # ---- every control tick --------------------------------------------------------------
     def step(self, dt):
-        """Move the commanded target toward the goal with a speed limit. Returns the target."""
-        delta = self.goal - self.target
-        dist = np.linalg.norm(delta)
-        max_step = self.rcfg.max_target_speed * dt
-        if dist > max_step:
-            delta *= max_step / dist
-        self.target = self.target + delta
-        max_roll = self.rcfg.max_roll_speed * dt
-        self.roll_target += float(np.clip(self.roll_goal - self.roll_target, -max_roll, max_roll))
+        """Move the commanded target toward the goal with speed and acceleration limits, so it
+        eases in and out instead of starting and stopping in steps. Returns the target."""
+        r = self.rcfg
+        self.target, self.velocity = approach(self.target, self.velocity, self.goal, r.max_target_speed,
+                                              r.max_target_accel, r.target_response, dt)
+        roll, self.roll_velocity = approach(np.array([self.roll_target]), self.roll_velocity,
+                                            np.array([self.roll_goal]), r.max_roll_speed, r.max_roll_accel,
+                                            r.target_response, dt)
+        self.roll_target = float(roll[0])
         if (self.homing and np.linalg.norm(self.goal - self.target) < 1e-3
                 and abs(self.roll_goal - self.roll_target) < 1e-3):
             self.homing = False

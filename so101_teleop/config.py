@@ -44,6 +44,7 @@ class RobotConfig:
     # (as you see it) needs a negative joint change to look clockwise on screen.
     wrist_roll_sign: float = -1.0
     max_roll_speed: float = 3.0  # rad/s
+    max_roll_accel: float = 15.0  # rad/s^2
 
     # How the hand's movement becomes joint angles (--ik):
     #   "jaws"  (default): the point between the jaws follows your hand 1:1, the gripper keeps its
@@ -61,6 +62,8 @@ class RobotConfig:
     reach_min: float = 0.35  # so the arm doesn't fold into itself
 
     max_target_speed: float = 0.35  # m/s, caps how fast the target point can move
+    max_target_accel: float = 2.5   # m/s^2: eases starts and stops (0 to full speed in 0.14 s)
+    target_response: float = 30.0   # 1/s: the target trails a moving hand by about 1/this seconds
     max_joint_speed: float = 3.0    # rad/s, IK velocity limit per joint
     joint_limit_margin: float = 0.05  # rad kept away from each joint limit
 
@@ -90,8 +93,17 @@ class MappingConfig:
     gain_roll: float = 1.0          # robot radians per hand radian
     roll_dead_zone: float = 0.03    # rad (~2 degrees)
 
-    smoothing: float = 0.35   # EMA factor per frame (0..1). Lower = smoother but laggier.
-    dead_zone: float = 0.004  # normalized image units of hand jitter that are ignored
+    # One Euro filter on the hand: cutoff (Hz) = min_cutoff + beta * speed. min_cutoff sets how
+    # smooth a still hand is (lower = steadier, laggier); beta how quickly fast motion gets through
+    # (higher = less lag when moving, a bit more jitter). Speeds: image widths/s, log-size/s, rad/s.
+    euro_min_cutoff: float = 1.0
+    euro_beta: float = 10.0
+    euro_min_cutoff_depth: float = 0.5
+    euro_beta_depth: float = 0.5
+    euro_min_cutoff_roll: float = 1.0
+    euro_beta_roll: float = 1.0
+    euro_d_cutoff: float = 1.0
+    dead_zone: float = 0.002  # normalized image units of hand jitter that are ignored
     depth_dead_zone: float = 0.03
     # Clutch behaviour: after the hand has been gone this many camera frames (~0.25 s), its new
     # position maps to wherever the robot is, so the arm never moves toward a re-appearing hand.

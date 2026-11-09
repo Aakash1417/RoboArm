@@ -64,14 +64,23 @@ class Camera:
             if not ok:
                 time.sleep(0.01)
                 continue
+            t = time.perf_counter()
             with self._lock:
                 self._frame = frame
                 self._frame_id += 1
+                self._frame_time = t
+
+    _frame_time = 0.0
 
     def latest(self):
         """Returns (frame_id, frame). frame_id only changes when a new frame arrives."""
         with self._lock:
             return self._frame_id, self._frame
+
+    def latest_timed(self):
+        """Returns (frame_id, frame, perf_counter time the frame was read from the camera)."""
+        with self._lock:
+            return self._frame_id, self._frame, self._frame_time
 
     def close(self):
         self._running = False
